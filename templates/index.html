@@ -590,28 +590,59 @@
     endBtn.addEventListener('click', async () => {
       if (!currentGame) return;
       if (!confirm('End current game?')) return;
-      // Try to notify server to mark game finished; if endpoint not present, fall back to clearing client state
+
+      // Attempt to notify server to mark game finished.
+      // On 404 we fall back to client-only end; on other non-OK responses surface the error and abort.
       try {
         const res = await fetch(`/api/games/${currentGame}/end_game`, { method: 'POST' });
-        if (!res.ok) {
-          console.warn('end_game endpoint unavailable or failed; falling back to client-only end.');
+        if (res.ok) {
+          // server accepted the end request
+        } else if (res.status === 404) {
+          // endpoint not implemented on server; fall back to client-side end
+          console.warn('end_game endpoint not implemented (404). Falling back to client-side end.');
+        } else {
+          // other server error - try to include message from body
+          let bodyStr = '';
+          try {
+            bodyStr = await res.text();
+          } catch (e) {
+            bodyStr = String(e);
+          }
+          let msg = `Server returned ${res.status} ${res.statusText}`;
+          if (bodyStr) {
+            try {
+              const j = JSON.parse(bodyStr);
+              if (j && (j.error || j.details)) msg += `: ${j.error || j.details}`;
+              else msg += `: ${bodyStr.slice(0,500)}`;
+            } catch (e) {
+              msg += `: ${bodyStr.slice(0,500)}`;
+            }
+          }
+          alert('Failed to end game on server: ' + msg);
+          return; // do not clear client state on unexpected server error
         }
       } catch (e) {
-        console.warn('Failed to call end_game endpoint; falling back to client-only end.', e);
+        // Network error while calling server -> surface to user and abort
+        const emsg = e && e.message ? e.message : String(e);
+        alert('Network error while trying to end game: ' + emsg);
+        return;
       }
 
-      // Clear persisted last-active-game so reload won't attempt to resume
-      (async function clearPersistedActiveGame() {
-        try {
-          await fetch('/api/settings', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ last_active_game_id: null }),
-          });
-        } catch (e) {
-          console.warn('Failed to clear persisted last-active-game', e);
+      // Clear persisted last-active-game so reload won't attempt to resume (best-effort).
+      try {
+        const r2 = await fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ last_active_game_id: null }),
+        });
+        if (!r2.ok) {
+          // log but continue with client-side clear
+          console.warn('Failed to clear persisted last-active-game on server', r2.status, r2.statusText);
         }
-      })();
+      } catch (e) {
+        console.warn('Failed to clear persisted last-active-game', e);
+      }
+
       // clear client state; game remains in DB (or was marked finished by server)
       currentGame = null;
       gameFinished = false;
@@ -632,37 +663,62 @@
       if (!currentGame) return;
       if (!confirm('Restart current game (reset scores and leg/sets)?')) return;
 
+      // Try to call server restart endpoint. If it returns 404 we fallback to client-side reset.
+      // If it returns another error we surface it to the user and abort so we don't silently fail.
+      let serverRestarted = false;
       try {
         const res = await fetch(`/api/games/${currentGame}/restart`, { method: 'POST' });
-        if (!res.ok) {
-          // If server doesn't implement restart endpoint, gracefully fall back to a client-side reset:
-          console.warn('restart endpoint failed or unavailable; performing client-side restart fallback.');
-          // Client fallback: clear markers, reset local visit state and reload state from server if possible.
-          window.clearMarkers();
-          throwsInVisit = 0;
-          currentVisitHits = [];
-          frozenLastVisitMarkers = null;
+        if (res.ok) {
+          serverRestarted = true;
+        } else if (res.status === 404) {
+          console.warn('restart endpoint not implemented on server (404). Performing client-side restart fallback.');
         } else {
-          // On success, server reset game state; clear local ephemeral markers/visits and reload state
-          window.clearMarkers();
-          throwsInVisit = 0;
-          currentVisitHits = [];
-          frozenLastVisitMarkers = null;
+          // Try to extract server error details
+          let bodyStr = '';
+          try { bodyStr = await res.text(); } catch (e) { bodyStr = String(e); }
+          let msg = `Server returned ${res.status} ${res.statusText}`;
+          if (bodyStr) {
+            try {
+              const j = JSON.parse(bodyStr);
+              if (j && (j.error || j.details)) msg += `: ${j.error || j.details}`;
+              else msg += `: ${bodyStr.slice(0,500)}`;
+            } catch (e) {
+              msg += `: ${bodyStr.slice(0,500)}`;
+            }
+          }
+          alert('Failed to restart game on server: ' + msg);
+          return; // abort to avoid silent fallback on unexpected server error
         }
       } catch (e) {
-        console.warn('Failed to call restart endpoint; falling back to client-side restart', e);
+        // Network error: surface to user and abort (no silent fallback)
+        const emsg = e && e.message ? e.message : String(e);
+        alert('Network error while trying to restart game: ' + emsg);
+        return;
+      }
+
+      // If server did not handle restart (404), or if it did, we still need to clear ephemeral client state
+      // so the UI reflects a fresh leg start.
+      try {
         window.clearMarkers();
         throwsInVisit = 0;
         currentVisitHits = [];
         frozenLastVisitMarkers = null;
-      } finally {
-        // Ensure UI reflects an active game after restart
-        startBtn.disabled = true;
-        restartGameBtn.disabled = false;
-        endBtn.disabled = false;
-        lockProfileInteractions(true);
-        // reload authoritative state from server (preserve our locally-decided currentTurn)
-        try { await loadState(true); } catch (e) { console.warn('loadState failed after restart', e); }
+      } catch (e) {
+        console.warn('Failed to clear local ephemeral state during restart', e);
+      }
+
+      // Ensure UI reflects an active game after restart
+      startBtn.disabled = true;
+      restartGameBtn.disabled = false;
+      endBtn.disabled = false;
+      lockProfileInteractions(true);
+
+      // reload authoritative state from server (preserve our locally-decided currentTurn)
+      try {
+        await loadState(true);
+      } catch (e) {
+        console.warn('loadState failed after restart', e);
+        // If loadState fails but we did perform a restart, keep the UI in a consistent client-side state.
       }
     });
 
