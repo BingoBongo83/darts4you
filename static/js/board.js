@@ -19,11 +19,21 @@ const SECTOR_ORDER = [
   20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5,
 ];
 
-const canvas = document.getElementById("board");
-const ctx = canvas && canvas.getContext ? canvas.getContext("2d") : null;
+let canvas = null;
+let ctx = null;
 
-let W = (canvas && canvas.width) || 640;
-let H = (canvas && canvas.height) || 640;
+function ensureCanvas() {
+  // Lazily obtain the canvas and 2D context when the element becomes available.
+  // This makes the module resilient if the script runs before the DOM has the
+  // canvas element or if the element is inserted later.
+  if (canvas && ctx) return;
+  canvas = document.getElementById("board");
+  ctx = canvas && canvas.getContext ? canvas.getContext("2d") : null;
+}
+
+/* Default sizes until a real canvas is present */
+let W = 640;
+let H = 640;
 let cx = W / 2;
 let cy = H / 2;
 
@@ -63,8 +73,12 @@ let bullsDeciderCurrent = 0;
 let bullsDeciderZoomed = false; // currently zoomed due to decider
 let bullsDeciderOverlayVisible = null; // overlay hit bounds when drawn
 
-// Audio (lazy)
+// Audio (lazy) + global sound settings (enabled + volume)
 let _audioCtx = null;
+// soundSettings is global so UI controls can toggle it.
+// Default: enabled with full volume. Templates/UI can set window.soundSettings.volume to [0..1] and enabled=true/false.
+window.soundSettings = window.soundSettings || { enabled: true, volume: 1.0 };
+
 function ensureAudioContext() {
   if (_audioCtx) return;
   try {
@@ -73,30 +87,138 @@ function ensureAudioContext() {
     _audioCtx = null;
   }
 }
-function playClickSoundSimple(freq = 880, dur = 0.12) {
-  // best-effort, fails silently if AudioContext not available or blocked
+
+/*
+ Enhanced click sound helper that respects window.soundSettings:
+ - If soundSettings.enabled === false, function is a no-op.
+ - Volume is controlled by soundSettings.volume (0.0 - 1.0) and scales the final gain.
+ - Accepts either a numeric frequency (legacy) or a string "kind" describing the event:
+   "normal", "show", "bulls", "bull", "sbull", "double", "triple", "miss"
+ - Produces a slightly richer sound using 1-2 oscillators and a master gain envelope.
+ - Best-effort: fails silently when AudioContext is not available or blocked by the browser.
+*/
+function playClickSoundSimple(kind = "normal", dur = 0.12) {
   try {
+    // Respect global sound control
+    if (!window.soundSettings || !window.soundSettings.enabled) return;
+
     ensureAudioContext();
     if (!_audioCtx) return;
     const now = _audioCtx.currentTime;
-    const o = _audioCtx.createOscillator();
-    const g = _audioCtx.createGain();
-    o.type = "sine";
-    o.frequency.setValueAtTime(freq, now);
-    g.gain.setValueAtTime(0.0001, now);
-    g.gain.exponentialRampToValueAtTime(0.12, now + 0.01);
-    g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
-    o.connect(g);
-    g.connect(_audioCtx.destination);
-    o.start(now);
-    o.stop(now + dur + 0.02);
+
+    // clamp volume [0..1]
+    const volume =
+      typeof window.soundSettings.volume === "number"
+        ? Math.max(0, Math.min(1, window.soundSettings.volume))
+        : 1;
+
+    // Default parameters
+    let freq = 760;
+    let secondaryFreq = null;
+    let wave = "sine";
+    let gainTarget = 0.12;
+
+    if (typeof kind === "number") {
+      // legacy numeric-frequency call
+      freq = kind;
+      secondaryFreq = null;
+      gainTarget = 0.12;
+    } else {
+      // named types for different dart events
+      switch ((kind || "").toString()) {
+        case "show":
+          freq = 980;
+          secondaryFreq = 1470;
+          gainTarget = 0.09;
+          break;
+        case "bulls":
+          freq = 520;
+          secondaryFreq = 780;
+          gainTarget = 0.14;
+          break;
+        case "bull":
+          freq = 540;
+          secondaryFreq = 810;
+          gainTarget = 0.16;
+          break;
+        case "sbull":
+          freq = 620;
+          secondaryFreq = 930;
+          gainTarget = 0.12;
+          break;
+        case "triple":
+          freq = 820;
+          secondaryFreq = 1220;
+          gainTarget = 0.14;
+          break;
+        case "double":
+          freq = 700;
+          secondaryFreq = 1050;
+          gainTarget = 0.13;
+          break;
+        case "miss":
+          freq = 320;
+          secondaryFreq = null;
+          wave = "triangle";
+          gainTarget = 0.06;
+          break;
+        case "normal":
+        default:
+          freq = 760;
+          secondaryFreq = null;
+          gainTarget = 0.11;
+          break;
+      }
+    }
+
+    // Apply user volume to the target gain. Ensure a small non-zero floor for ramps.
+    const appliedGain = Math.max(0.0001, gainTarget * volume);
+
+    // Master gain envelope (obeying user volume)
+    const master = _audioCtx.createGain();
+    master.gain.setValueAtTime(0.0001, now);
+    master.gain.exponentialRampToValueAtTime(appliedGain, now + 0.01);
+    // fade to near-zero at the end
+    try {
+      master.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    } catch (e) {
+      // fallback if exponential ramp to 0 is rejected
+      master.gain.linearRampToValueAtTime(0.0001, now + dur);
+    }
+
+    // Primary oscillator
+    const o1 = _audioCtx.createOscillator();
+    o1.type = wave;
+    o1.frequency.setValueAtTime(freq, now);
+    o1.connect(master);
+
+    // Optional secondary oscillator for a richer timbre
+    let o2 = null;
+    if (secondaryFreq) {
+      o2 = _audioCtx.createOscillator();
+      o2.type = "sine";
+      o2.frequency.setValueAtTime(secondaryFreq, now);
+      // slight detune for warmth if supported
+      if (o2.detune) o2.detune.setValueAtTime(6, now);
+      o2.connect(master);
+    }
+
+    master.connect(_audioCtx.destination);
+
+    o1.start(now);
+    if (o2) o2.start(now);
+    o1.stop(now + dur + 0.02);
+    if (o2) o2.stop(now + dur + 0.02);
   } catch (e) {
-    // ignore
+    // ignore audio errors silently
   }
 }
 
 /* Compute geometric sizes based on canvas size */
 function computeSizes() {
+  // Ensure we have a valid canvas/context reference before computing sizes.
+  ensureCanvas();
+  if (!canvas) return;
   W = canvas.width;
   H = canvas.height;
   cx = W / 2;
@@ -124,7 +246,9 @@ function roundedRect(ctxLocal, x, y, width, height, radius) {
 
 /* Apply current zoom transform to ctx. */
 function applyZoomTransform() {
-  if (!ctx) return;
+  // Ensure we have the canvas/context before attempting transforms.
+  ensureCanvas();
+  if (!canvas || !ctx) return;
   if (!zoomState || zoomState.scale === 1) return;
   const zx = zoomState.centerX * canvas.width;
   const zy = zoomState.centerY * canvas.height;
@@ -181,7 +305,10 @@ function animateZoomTo(centerX, centerY, targetScale, duration = 300) {
 
 /* Draw the dartboard */
 function drawBoard() {
-  if (!ctx) return;
+  // Make sure canvas/context exist before drawing. computeSizes will also attempt to
+  // resolve the canvas, but guard here to avoid using a null ctx.
+  ensureCanvas();
+  if (!canvas || !ctx) return;
   computeSizes();
   ctx.save();
   ctx.clearRect(0, 0, W, H);
@@ -321,7 +448,9 @@ function hitToCoord(hit) {
    Markers support a short pulse animation when created; animation driven by presence of animStart/animDur on marker objects.
 */
 function drawMarkersLayer() {
-  if (!ctx) return;
+  // Ensure canvas & context exist (script may have run before DOM finished)
+  ensureCanvas();
+  if (!canvas || !ctx) return;
   const now = performance.now();
 
   // Official markers (played darts)
@@ -388,7 +517,9 @@ function drawMarkersLayer() {
 
 /* Draw bulls-decider overlay in screen coordinates (non-transformed) */
 function drawBullsOverlay() {
-  if (!ctx) return;
+  // Ensure canvas/context before overlay drawing (overlay uses screen coordinates)
+  ensureCanvas();
+  if (!canvas || !ctx) return;
   // show overlay if decider is active OR if zoom is active (so user sees hint)
   if (!bullsDeciderActive && zoomState.scale === 1) {
     bullsDeciderOverlayVisible = null;
@@ -481,6 +612,10 @@ function drawBullsOverlay() {
 function redrawAll() {
   drawBoard();
 }
+// Expose a named alias used by the page template. Some templates call
+// `window.redrawBoard()` after resizing; ensure that exists and forwards
+// to the internal redraw helper.
+window.redrawBoard = redrawAll;
 
 /* Exposed API: showMarkers / clearMarkers */
 window.showMarkers = function (hits, color = "rgba(255,255,50,0.95)") {
@@ -499,7 +634,7 @@ window.showMarkers = function (hits, color = "rgba(255,255,50,0.95)") {
     return copy;
   });
   try {
-    playClickSoundSimple(880, 0.12);
+    playClickSoundSimple("show", 0.16);
   } catch (e) {}
   redrawAll();
 };
@@ -553,7 +688,7 @@ window.bullsDeciderAddMarker = function (x_norm, y_norm, player_id) {
   };
   bullsMarkers.push(marker);
   try {
-    playClickSoundSimple(720, 0.12);
+    playClickSoundSimple("bulls", 0.14);
   } catch (e) {}
   redrawAll();
 };
@@ -607,8 +742,34 @@ window.bullsDeciderCancel = function () {
    - If overlay buttons clicked, handle them
    - Otherwise map screen coords to logical coords using inverse transform and compute sector
 */
-if (canvas) {
-  canvas.addEventListener("click", function (e) {
+/* Robust attachment of canvas handlers:
+   - If the canvas element is not present when this script runs, use a MutationObserver
+     to detect when it is inserted into the DOM.
+   - Attach the click handler exactly once (idempotent) using a marker on the element.
+   - Always attempt an initial attach in case the canvas already exists.
+*/
+let __boardHandlerAttached = false;
+
+function attachCanvasHandlersOnce() {
+  // ensure canvas reference
+  ensureCanvas();
+  if (!canvas) return;
+  // idempotent guard per-element (use a property so re-parsing doesn't reattach)
+  try {
+    if (canvas.__boardHandlerAttached) return;
+    canvas.__boardHandlerAttached = true;
+  } catch (e) {
+    // ignore if property can't be set (very unusual); fall back to module-level guard
+    if (__boardHandlerAttached) return;
+    __boardHandlerAttached = true;
+  }
+
+  // Define click handler (same behavior as before)
+  const _clickHandler = function (e) {
+    // ensure we have current canvas/ctx references (defensive)
+    ensureCanvas();
+    if (!canvas) return;
+
     const rect = canvas.getBoundingClientRect();
     const pixelX = e.clientX - rect.left;
     const pixelY = e.clientY - rect.top;
@@ -707,7 +868,24 @@ if (canvas) {
 
     // audio + visual feedback for every dart click
     try {
-      playClickSoundSimple(750, 0.12);
+      // Choose a sound type based on the hit context for a clearer auditory cue
+      let _soundType = "normal";
+      if (bullsDeciderActive) {
+        _soundType = "bulls";
+      } else if (sector === 25 && multiplier === 2) {
+        _soundType = "bull";
+      } else if (sector === 25 && multiplier === 1) {
+        _soundType = "sbull";
+      } else if (multiplier === 3) {
+        _soundType = "triple";
+      } else if (multiplier === 2) {
+        _soundType = "double";
+      } else if (multiplier === 0) {
+        _soundType = "miss";
+      } else {
+        _soundType = "normal";
+      }
+      playClickSoundSimple(_soundType, 0.12);
     } catch (e) {}
 
     // If decider active, add to bullsMarkers (we also call bullsDeciderAddMarker elsewhere)
@@ -757,8 +935,132 @@ if (canvas) {
         console.warn("onDartHit handler threw", e);
       }
     }
-  });
+  };
+
+  // Attach handler to canvas
+  canvas.addEventListener("click", _clickHandler);
+  // Ensure initial visual is painted
+  try {
+    redrawAll();
+  } catch (e) {}
 }
+
+// If canvas is not yet in the DOM, observe for insertion and attach when available
+if (typeof MutationObserver !== "undefined") {
+  const mo = new MutationObserver(function (mutations, obs) {
+    ensureCanvas();
+    if (canvas) {
+      attachCanvasHandlersOnce();
+      // We can disconnect once the canvas is found and handlers attached.
+      try {
+        obs.disconnect();
+      } catch (e) {}
+    }
+  });
+  try {
+    mo.observe(document.documentElement || document.body, {
+      childList: true,
+      subtree: true,
+    });
+  } catch (e) {
+    // ignore observation errors (fallback will attempt attach immediately below)
+  }
+}
+
+// Final attempt to attach immediately in case the canvas is already present.
+try {
+  attachCanvasHandlersOnce();
+} catch (e) {
+  // ignore attach errors so app can continue
+}
+
+// Some browsers or complex layouts sometimes drop the initial synchronous paint.
+// Schedule several deferred resize/redraw attempts to force reflow/repaint. This
+// helps in cases where the canvas remains visually blank until the user clicks.
+(function scheduleDeferredRedraws() {
+  const attempts = [50, 150, 350, 700, 1200];
+  const doOne = () => {
+    try {
+      ensureCanvas();
+      if (!canvas) return;
+
+      // Prefer the page-provided resizeBoard when available (it also restores markers).
+      if (typeof window.resizeBoard === "function") {
+        try {
+          window.resizeBoard();
+        } catch (e) {
+          /* ignore page resize errors */
+        }
+      } else {
+        // Compute a sensible size like resizeBoard would and apply it if changed.
+        try {
+          const wrap = canvas.parentElement || document.body;
+          const size = Math.min(
+            Math.max(160, wrap.clientWidth - 36),
+            Math.max(160, window.innerHeight - 240),
+          );
+          if (canvas.width !== size || canvas.height !== size) {
+            canvas.width = size;
+            canvas.height = size;
+          }
+        } catch (e) {
+          /* ignore sizing errors */
+        }
+
+        // Force a draw and do a tiny style nudge to coax browsers into repainting.
+        try {
+          redrawAll();
+          // A small transform tweak can help trigger the compositor pathway in some engines.
+          const prev = canvas.style.transform || "";
+          // Append a harmless 3d transform if not present to trigger compositing.
+          canvas.style.transform = prev + " translateZ(0)";
+          // Revert after a short delay so we don't permanently alter layout.
+          setTimeout(() => {
+            try {
+              canvas.style.transform = prev;
+            } catch (e) {}
+          }, 30);
+        } catch (err) {
+          /* ignore drawing errors */
+        }
+      }
+
+      // Try a tiny, invisible context operation to flush the drawing pipeline.
+      try {
+        if (ctx) {
+          ctx.save();
+          ctx.globalAlpha = 0;
+          ctx.fillRect(0, 0, 1, 1);
+          ctx.restore();
+        }
+      } catch (err) {
+        /* ignore ctx flush errors */
+      }
+    } catch (err) {
+      /* defensive ignore */
+    }
+  };
+
+  for (const t of attempts) {
+    setTimeout(doOne, t);
+  }
+
+  // One final requestAnimationFrame after the last timeout to ensure a composed frame.
+  setTimeout(
+    () => {
+      try {
+        requestAnimationFrame(() => {
+          try {
+            ensureCanvas();
+            if (typeof window.resizeBoard === "function") window.resizeBoard();
+            else if (ctx) redrawAll();
+          } catch (e) {}
+        });
+      } catch (e) {}
+    },
+    attempts[attempts.length - 1] + 50,
+  );
+})();
 
 /* Provide a safe resizeBoard if the page hasn't defined one.
    The template normally defines resizeBoard; only create ours if absent.
@@ -798,6 +1100,37 @@ window.addEventListener("load", function () {
     console.warn("board init error", e);
   }
 });
+
+// Also perform initialization immediately if the script runs after the document has already loaded.
+// This fixes the invisible board case when the script is injected or the page was already ready.
+try {
+  if (
+    document.readyState === "complete" ||
+    document.readyState === "interactive"
+  ) {
+    // Attempt to resolve the canvas element (if the DOM is already ready)
+    ensureCanvas();
+    if (typeof window.resizeBoard === "function") {
+      // Let the page-provided resizeBoard handle sizing if available.
+      window.resizeBoard();
+    } else if (canvas) {
+      // fallback sizing (same logic as above)
+      const wrap = canvas.parentElement || document.body;
+      const size = Math.min(
+        Math.max(160, wrap.clientWidth - 36),
+        Math.max(160, window.innerHeight - 240),
+      );
+      canvas.width = size;
+      canvas.height = size;
+      // redraw only if we have a valid ctx
+      ensureCanvas();
+      if (ctx) redrawAll();
+    }
+  }
+} catch (e) {
+  // Log but don't throw — initialization may not be critical in some contexts
+  console.warn("board init (immediate) error", e);
+}
 
 /* Debug helpers */
 window._boardDebug = {

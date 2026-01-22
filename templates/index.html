@@ -86,6 +86,48 @@
       width: 360px;
       z-index: 71;
     }
+
+    /* Sound control (small corner UI) */
+    #soundControl {
+      position: fixed;
+      top: 12px;
+      right: 12px;
+      background: linear-gradient(180deg, rgba(7,24,38,0.9), rgba(6,18,27,0.9));
+      border: 1px solid rgba(255,255,255,0.04);
+      color: #e6eef6;
+      padding: 8px 10px;
+      border-radius: 8px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      z-index: 120;
+      box-shadow: 0 6px 18px rgba(0,0,0,0.5);
+      font-size: 13px;
+      pointer-events: auto;
+    }
+    #soundControl input[type="range"] {
+      -webkit-appearance: none;
+      appearance: none;
+      height: 6px;
+      background: rgba(255,255,255,0.04);
+      border-radius: 6px;
+      outline: none;
+    }
+    #soundControl input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: rgba(32,201,151,0.95);
+      box-shadow: 0 1px 4px rgba(0,0,0,0.4);
+      cursor: pointer;
+    }
+    #soundControl label {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      cursor: pointer;
+    }
   </style>
 </head>
 <body>
@@ -119,6 +161,15 @@
         Select players by clicking their names below. Click a selected player again to remove them before starting the game.
       </div>
     </header>
+
+    <!-- Sound control: enable/disable + volume slider -->
+    <div id="soundControl" aria-label="Enable or disable board sounds" title="Sound">
+      <label for="soundEnableCheckbox" style="color:var(--muted);">
+        <input id="soundEnableCheckbox" type="checkbox" checked />
+        <span style="font-size:13px; color:var(--muted);">Sound</span>
+      </label>
+      <input id="soundVolumeSlider" type="range" min="0" max="100" value="100" aria-label="Sound volume" />
+    </div>
 
     <main class="main-grid" style="gap:12px;">
       <aside class="left-col">
@@ -251,6 +302,81 @@
     let currentVisitHits = [];
     let frozenLastVisitMarkers = null;
     let pendingProfileToAutoAdd = null;
+
+    // Sound settings / UI wiring
+    // Ensure global soundSettings exists (board.js will also reference window.soundSettings)
+    window.soundSettings = window.soundSettings || { enabled: true, volume: 1.0 };
+
+    function initSoundControls() {
+      try {
+        const cb = document.getElementById('soundEnableCheckbox');
+        const slider = document.getElementById('soundVolumeSlider');
+        if (!cb || !slider) return;
+
+        // Initialize control states from global settings
+        cb.checked = !!window.soundSettings.enabled;
+        slider.value = Math.round((window.soundSettings.volume || 1) * 100);
+
+        // helper to persist settings server-side
+        async function persistSettings() {
+          try {
+            await fetch('/api/settings', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                sound_enabled: !!window.soundSettings.enabled,
+                sound_volume: typeof window.soundSettings.volume === 'number' ? window.soundSettings.volume : 1.0,
+              }),
+            });
+          } catch (err) {
+            // best-effort: don't block UI on persistence errors
+            console.warn('Failed to persist sound settings', err);
+          }
+        }
+
+        // Toggle enable/disable
+        cb.addEventListener('change', function () {
+          window.soundSettings.enabled = !!cb.checked;
+          // attempt to resume audio context when enabling
+          try {
+            if (window.soundSettings.enabled && typeof ensureAudioContext === 'function') {
+              ensureAudioContext();
+              if (window._audioCtx && typeof window._audioCtx.resume === 'function') {
+                window._audioCtx.resume().catch(() => {});
+              }
+            }
+          } catch (e) {}
+          // persist new setting
+          persistSettings();
+        });
+
+        // Volume change (0..100 slider -> 0.0..1.0)
+        slider.addEventListener('input', function () {
+          const v = Math.max(0, Math.min(100, Number(slider.value)));
+          window.soundSettings.volume = v / 100;
+          // persist immediately (best-effort)
+          persistSettings();
+        });
+
+        // In case other code toggles settings, keep UI in sync periodically while page active
+        setInterval(function () {
+          if (document.hidden) return;
+          if (cb && slider) {
+            if (cb.checked !== !!window.soundSettings.enabled) cb.checked = !!window.soundSettings.enabled;
+            const vol100 = Math.round((window.soundSettings.volume || 1) * 100);
+            if (String(slider.value) !== String(vol100)) slider.value = vol100;
+          }
+        }, 800);
+      } catch (e) {
+        // don't block app on sound control failures
+        console.warn('sound control init failed', e);
+      }
+    }
+
+    // Defer init slightly to ensure DOM nodes are present
+    window.addEventListener('load', function () {
+      setTimeout(initSoundControls, 50);
+    });
 
     // Elements
     const profilesListEl = document.getElementById('profilesList');
@@ -471,6 +597,19 @@
       } catch (e) {
         console.warn('Failed to call end_game endpoint; falling back to client-only end.', e);
       }
+
+      // Clear persisted last-active-game so reload won't attempt to resume
+      (async function clearPersistedActiveGame() {
+        try {
+          await fetch('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ last_active_game_id: null }),
+          });
+        } catch (e) {
+          console.warn('Failed to clear persisted last-active-game', e);
+        }
+      })();
       // clear client state; game remains in DB (or was marked finished by server)
       currentGame = null;
       gameFinished = false;
@@ -503,6 +642,25 @@
       // store finished flag so throws are blocked when game is over
       gameFinished = Boolean(data && data.game && data.game.finished);
       players = data.players || [];
+
+      // Restore active player index from server-side persisted value when available
+      if (data && data.game) {
+        // prefer persisted current_active_index; fall back to current_start_index if needed
+        let idx = null;
+        if (typeof data.game.current_active_index !== 'undefined' && data.game.current_active_index !== null) {
+          idx = Number(data.game.current_active_index);
+        } else if (typeof data.game.current_start_index !== 'undefined' && data.game.current_start_index !== null) {
+          idx = Number(data.game.current_start_index);
+        }
+        // validate and apply
+        if (idx !== null && players && players.length) {
+          if (idx < 0 || idx >= players.length) idx = 0;
+          currentTurn = idx;
+        } else {
+          currentTurn = 0;
+        }
+      }
+
       renderPlayers(players);
     }
 
@@ -557,6 +715,19 @@
       frozenLastVisitMarkers = null;
       window.clearMarkers();
       highlightActivePlayer();
+
+      // persist active-player selection to server so reloads restore it
+      try {
+        if (currentGame !== null) {
+          fetch(`/api/games/${currentGame}/set_active`, {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ active_index: currentTurn })
+          }).catch(()=>{});
+        }
+      } catch (e) {
+        // best-effort only
+      }
     }
 
     async function advanceToNextPlayer() {
@@ -568,6 +739,20 @@
       throwsInVisit = 0;
       currentVisitHits = [];
       highlightActivePlayer();
+
+      // persist active player index after advancing
+      try {
+        if (currentGame !== null) {
+          fetch(`/api/games/${currentGame}/set_active`, {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ active_index: currentTurn })
+          }).catch(()=>{});
+        }
+      } catch (e) {
+        // ignore persistence errors
+      }
+
       await loadState();
     }
 
@@ -642,6 +827,20 @@
         currentVisitHits = [];
         frozenLastVisitMarkers = null;
         window.clearMarkers();
+
+        // Persist last-active game id so reloads can resume this game
+        (async function persistActiveGame() {
+          try {
+            await fetch('/api/settings', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ last_active_game_id: currentGame }),
+            });
+          } catch (e) {
+            // best-effort; ignore persistence errors
+            console.warn('Failed to persist last-active game id', e);
+          }
+        })();
 
         // mark UI state
         startBtn.disabled = true;
@@ -767,6 +966,19 @@
               // set currentTurn to chosen index and highlight
               currentTurn = bestIdx;
               highlightActivePlayer();
+
+              // persist chosen starter as active player on server
+              try {
+                if (currentGame !== null) {
+                  await fetch(`/api/games/${currentGame}/set_active`, {
+                    method: 'POST',
+                    headers: {'Content-Type':'application/json'},
+                    body: JSON.stringify({ active_index: currentTurn })
+                  });
+                }
+              } catch (e) {
+                // best-effort
+              }
 
               // End visual bulls-decider UI and reset zoom
               try {
@@ -968,6 +1180,38 @@
     // Init
     (async function init(){
       await fetchProfiles();
+
+      // Load persisted settings (sound + last-active-game) and apply them.
+      try {
+        const r = await fetch('/api/settings');
+        if (r.ok) {
+          const s = await r.json();
+          if (s) {
+            // apply sound settings for immediate use by board.js
+            window.soundSettings = window.soundSettings || { enabled: true, volume: 1.0 };
+            if (typeof s.sound_enabled !== 'undefined') window.soundSettings.enabled = !!s.sound_enabled;
+            if (typeof s.sound_volume !== 'undefined') window.soundSettings.volume = Number(s.sound_volume) || 1.0;
+            // Ensure sound controls reflect persisted state
+            try { initSoundControls(); } catch (e) {}
+            // If there is a last-active-game and the game still exists, restore it
+            if (s.last_active_game_id) {
+              try {
+                currentGame = Number(s.last_active_game_id);
+                await loadState();
+              } catch (e) {
+                console.warn('Failed to restore last active game', e);
+                // fallback: no game restored
+                currentGame = null;
+              }
+            }
+          }
+        }
+      } catch (e) {
+        // ignore settings load errors and proceed
+        console.warn('Failed to load persisted settings', e);
+      }
+
+      // Ensure canvas sized after possible state restore
       resizeBoard();
     })();
   </script>

@@ -7,6 +7,7 @@ from datetime import datetime
 from flask import Flask, abort, jsonify, render_template, request
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
 from checkout import find_checkout
 
@@ -22,6 +23,29 @@ class Profile(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(80), unique=True, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class Settings(db.Model):
+    """
+    Simple single-row settings table to persist small client preferences and the
+    last active game id so the frontend can restore an in-progress game after reload.
+    """
+
+    id = db.Column(db.Integer, primary_key=True)
+    # Persist the last active (not-finished) game id for client restore
+    last_active_game_id = db.Column(db.Integer, nullable=True)
+    # Sound preferences (mirrors window.soundSettings on client)
+    sound_enabled = db.Column(db.Boolean, default=True)
+    sound_volume = db.Column(db.Float, default=1.0)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "last_active_game_id": self.last_active_game_id,
+            "sound_enabled": bool(self.sound_enabled),
+            "sound_volume": float(self.sound_volume) if self.sound_volume is not None else 1.0,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
 
 
 class Game(db.Model):
@@ -44,6 +68,9 @@ class Game(db.Model):
     # The index (0-based) of the player who will start the current leg within game.players order.
     # This is persisted so rotation works across reloads.
     current_start_index = db.Column(db.Integer, default=0)
+    # Index (0-based) of the currently active player within game.players order.
+    # Persisting this allows the frontend to restore which player is to throw next after a reload.
+    current_active_index = db.Column(db.Integer, default=0)
 
     # Whether the game/match is finished
     finished = db.Column(db.Boolean, default=False)
@@ -139,6 +166,14 @@ with app.app_context():
                 if not _has_column("throw", "profile_id"):
                     # The table name 'throw' is simple, but quote it to be safe
                     conn.execute('ALTER TABLE "throw" ADD COLUMN profile_id INTEGER')
+                # Backfill for newer game column added to persist the active player index across reloads
+                # Older DBs may be missing this column; add a simple integer defaulting to 0.
+                if not _has_column("game", "current_active_index"):
+                    try:
+                        conn.execute("ALTER TABLE game ADD COLUMN current_active_index INTEGER DEFAULT 0")
+                    except Exception:
+                        # Best-effort only; ignore failures to allow app to start with existing DB
+                        pass
             finally:
                 conn.close()
     except Exception:
@@ -238,6 +273,12 @@ def ensure_schema_compatibility():
                 if _has_column("game", "current_start_index") is False:
                     try:
                         conn.execute("ALTER TABLE game ADD COLUMN current_start_index INTEGER DEFAULT 0")
+                    except Exception:
+                        pass
+                # Add current_active_index to allow persisting/restoring which player is to throw next.
+                if _has_column("game", "current_active_index") is False:
+                    try:
+                        conn.execute("ALTER TABLE game ADD COLUMN current_active_index INTEGER DEFAULT 0")
                     except Exception:
                         pass
                 if _has_column("game", "finished") is False:
@@ -398,6 +439,60 @@ def profile_stats(profile_id):
     )
 
 
+# Simple settings API so the frontend can persist/retrieve preferences and last-active-game
+@app.route("/api/settings", methods=["GET", "POST"])
+def settings_api():
+    """
+    GET: returns settings (single-row). If absent, returns sensible defaults.
+    POST: accepts JSON to update fields:
+      { "last_active_game_id": <int|null>, "sound_enabled": true/false, "sound_volume": 0.0..1.0 }
+    """
+    if request.method == "GET":
+        s = Settings.query.first()
+        if not s:
+            # defaults
+            return jsonify(
+                {
+                    "last_active_game_id": None,
+                    "sound_enabled": True,
+                    "sound_volume": 1.0,
+                }
+            )
+        return jsonify(s.to_dict())
+
+    data = request.json or {}
+    try:
+        s = Settings.query.first()
+        if not s:
+            s = Settings()
+            db.session.add(s)
+        if "last_active_game_id" in data:
+            s.last_active_game_id = data.get("last_active_game_id")
+        if "sound_enabled" in data:
+            s.sound_enabled = bool(data.get("sound_enabled"))
+        if "sound_volume" in data:
+            # Safely handle None, numeric and string inputs without calling float(None).
+            sv = data.get("sound_volume")
+            try:
+                if sv is None:
+                    # explicit null -> reset to default 1.0
+                    s.sound_volume = 1.0
+                else:
+                    # accept numeric or numeric-string; ValueError/TypeError handled below
+                    s.sound_volume = max(0.0, min(1.0, float(sv)))
+            except (ValueError, TypeError):
+                # invalid value; ignore and leave existing value unchanged
+                pass
+        db.session.commit()
+        return jsonify(s.to_dict())
+    except Exception as e:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        return jsonify({"error": "Failed to update settings", "details": str(e)}), 500
+
+
 # Game creation
 @app.route("/api/new_game", methods=["POST"])
 def new_game():
@@ -441,7 +536,32 @@ def new_game():
         starting = 501 if mode in ("501", "301") else 0
         if mode == "301":
             starting = 301
+
+        # Persist optional game options supplied by the client:
+        # legs_to_win (int), sets_to_win (int), first_throw_method (string)
+        legs_to_win = payload.get("legs_to_win")
+        sets_to_win = payload.get("sets_to_win")
+        first_method = payload.get("first_throw_method")
+
         game = Game(mode=mode)
+        # apply provided options when present (best-effort parsing)
+        if legs_to_win is not None:
+            try:
+                game.legs_to_win = int(legs_to_win)
+            except Exception:
+                # ignore invalid values and leave default
+                pass
+        if sets_to_win is not None:
+            try:
+                game.sets_to_win = int(sets_to_win)
+            except Exception:
+                pass
+        if first_method is not None:
+            try:
+                game.first_throw_method = str(first_method)
+            except Exception:
+                pass
+
         db.session.add(game)
         db.session.flush()
         created_players = []
@@ -466,6 +586,22 @@ def new_game():
             db.session.add(pl)
             created_players.append({"id": pl.id, "name": name, "profile_id": pl.profile_id})
         db.session.commit()
+
+        # Persist last-active game id so frontend can restore after reload
+        try:
+            s = Settings.query.first()
+            if not s:
+                s = Settings(last_active_game_id=game.id)
+                db.session.add(s)
+            else:
+                s.last_active_game_id = game.id
+            db.session.commit()
+        except Exception:
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
+
         return jsonify({"game_id": game.id, "players_created": created_players})
     except Exception as e:
         # On error, ensure the transaction is rolled back and return a JSON error payload
@@ -613,6 +749,51 @@ def set_starter(game_id):
     return jsonify({"status": "ok", "current_start_index": game.current_start_index})
 
 
+@app.route("/api/games/<int:game_id>/set_active", methods=["POST"])
+def set_active_player(game_id):
+    """
+    Set which player is currently active for this game.
+    Accepts JSON:
+      { "player_id": <int> }       # sets current_active_index to the index of that player
+    or
+      { "active_index": <int> }    # set index directly (0-based)
+    Returns 200 with updated current_active_index on success.
+    """
+    game = Game.query.get_or_404(game_id)
+    data = request.json or {}
+    player_id = data.get("player_id")
+    active_index = data.get("active_index")
+
+    if player_id is not None:
+        try:
+            player_id = int(player_id)
+        except Exception:
+            return jsonify({"error": "Invalid player_id"}), 400
+        # find index of that player in the game's players list (preserve order)
+        index = None
+        for idx, p in enumerate(game.players):
+            if p.id == player_id:
+                index = idx
+                break
+        if index is None:
+            return jsonify({"error": "Player not part of this game"}), 404
+        game.current_active_index = index
+    elif active_index is not None:
+        try:
+            ai = int(active_index)
+        except Exception:
+            return jsonify({"error": "Invalid active_index"}), 400
+        if ai < 0 or (len(game.players) and ai >= len(game.players)):
+            return jsonify({"error": "active_index out of range"}), 400
+        game.current_active_index = ai
+    else:
+        return jsonify({"error": "player_id or active_index required"}), 400
+
+    db.session.add(game)
+    db.session.commit()
+    return jsonify({"status": "ok", "current_active_index": game.current_active_index})
+
+
 @app.route("/api/games/<int:game_id>/next_leg", methods=["POST"])
 def next_leg(game_id):
     """
@@ -640,6 +821,12 @@ def next_leg(game_id):
     count = len(game.players) if game.players is not None else 0
     if count:
         game.current_start_index = ((game.current_start_index or 0) + 1) % count
+        # set the active player to the rotated start index so client reloads restore the correct active player
+        try:
+            game.current_active_index = game.current_start_index
+        except Exception:
+            # best-effort: ignore if column missing / invalid
+            pass
 
     db.session.add(game)
     db.session.commit()
@@ -683,6 +870,13 @@ def restart_game(game_id):
         game.current_start_index = 0
     except Exception:
         pass
+
+    # reset active player index to the starting index on restart
+    try:
+        game.current_active_index = getattr(game, "current_start_index", 0)
+    except Exception:
+        game.current_active_index = 0
+
     game.finished = False
 
     db.session.add(game)
@@ -702,13 +896,40 @@ def end_game(game_id):
     game.finished = True
     db.session.add(game)
     db.session.commit()
+
+    # If this game was the recorded last_active_game_id, clear it so frontend won't try to restore a finished game
+    try:
+        s = Settings.query.first()
+        if s and s.last_active_game_id == game.id:
+            s.last_active_game_id = None
+            db.session.add(s)
+            db.session.commit()
+    except Exception:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+
     return jsonify({"status": "ok", "message": "Game ended"})
 
 
 # Game state (includes per-player last visit hits and stats, legs/sets state and match history)
 @app.route("/api/game_state/<int:game_id>", methods=["GET"])
 def game_state(game_id):
-    game = Game.query.get_or_404(game_id)
+    # Attempt to load the game row. Missing columns on older SQLite DBs can raise
+    # an OperationalError (e.g. "no such column: game.current_active_index").
+    # In that case, try a best-effort schema compatibility step and retry once.
+    try:
+        game = Game.query.get_or_404(game_id)
+    except OperationalError:
+        # Perform compatibility fixes (ALTER TABLE ... ADD COLUMN where possible)
+        # then retry the query once. If this still fails the exception will propagate.
+        try:
+            ensure_schema_compatibility()
+        except Exception:
+            # If the compatibility step itself fails, re-raise to keep behavior unchanged.
+            raise
+        game = Game.query.get_or_404(game_id)
     players_out = []
     # produce per-player view
     for p in game.players:
@@ -803,6 +1024,8 @@ def game_state(game_id):
         "current_leg": game.current_leg,
         "first_throw_method": game.first_throw_method,
         "current_start_index": getattr(game, "current_start_index", 0),
+        # Expose the persisted currently active player index so the client can restore currentTurn
+        "current_active_index": getattr(game, "current_active_index", getattr(game, "current_start_index", 0)),
         "finished": bool(game.finished),
     }
 
@@ -874,6 +1097,11 @@ def register_throw():
             count = len(Game.query.get(game.id).players)
         if count:
             game.current_start_index = ((game.current_start_index or 0) + 1) % count
+            # when a new leg starts, ensure the active player index follows the current_start_index
+            try:
+                game.current_active_index = game.current_start_index
+            except Exception:
+                pass
 
     # Helper: start a new set
     def _start_new_set():
