@@ -1,0 +1,494 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Darts Scorer</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <style>
+    /* Small additions specific to this template */
+    .profiles-bottom {
+      margin-top: 18px;
+      padding-top: 12px;
+      border-top: 1px solid rgba(255,255,255,0.03);
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+      align-items:center;
+    }
+    .profile-chip {
+      background: rgba(255,255,255,0.02);
+      padding:6px 8px;
+      border-radius:8px;
+      display:flex;
+      align-items:center;
+      gap:8px;
+      cursor:pointer;
+      user-select:none;
+      border:1px solid rgba(255,255,255,0.02);
+    }
+    .profile-chip.selected {
+      background: linear-gradient(90deg, rgba(32,201,151,0.12), rgba(32,201,151,0.06));
+      border-color: rgba(32,201,151,0.18);
+      transform: translateY(-2px);
+    }
+    .controls-row .btn.secondary {
+      background: transparent;
+      border: 1px solid rgba(255,255,255,0.06);
+      color: var(--muted);
+    }
+    /* Modal */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.6);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 60;
+    }
+    .modal {
+      background: linear-gradient(180deg, #071826, #06141b);
+      border:1px solid rgba(255,255,255,0.04);
+      padding:18px;
+      border-radius:12px;
+      width: 420px;
+      color: #e6eef6;
+      box-shadow: 0 12px 48px rgba(0,0,0,0.6);
+    }
+    .modal h3 { margin:0 0 8px 0; }
+    .modal .row { display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px dashed rgba(255,255,255,0.02); }
+    .modal .row:last-child { border-bottom: none; }
+    .profiles-actions { display:flex; gap:8px; align-items:center; margin-left:8px; }
+    .profile-name { font-weight:600; color:#e6eef6; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="app-header">
+      <h1>Darts Scorer</h1>
+
+      <div class="controls-row" style="align-items:center; gap:12px;">
+        <label>Mode:
+          <select id="mode">
+            <option value="501">501</option>
+            <option value="301">301</option>
+            <option value="cricket">Cricket</option>
+            <option value="around">Around the Clock</option>
+          </select>
+        </label>
+
+        <button id="startGameBtn" class="btn">Start Game</button>
+        <button id="endGameBtn" class="btn secondary" disabled>End Game</button>
+
+        <div style="flex:1"></div>
+
+        <div style="display:flex; gap:8px; align-items:center;">
+          <input id="newProfileName" placeholder="Add player name" style="padding:6px; border-radius:6px; background:var(--card); color:var(--muted); border:1px solid rgba(255,255,255,0.03)"/>
+          <button id="addProfileBtn" class="btn">Add Player</button>
+        </div>
+      </div>
+
+      <div style="margin-top:8px; color:var(--muted); font-size:13px;">
+        Select players by clicking their names below. Click a selected player again to remove them before starting the game.
+      </div>
+    </header>
+
+    <main class="main-grid" style="gap:12px;">
+      <aside class="left-col">
+        <div id="playersList" class="players-list"></div>
+      </aside>
+
+      <section class="right-col">
+        <div class="board-wrap">
+          <canvas id="board" width="640" height="640"></canvas>
+        </div>
+      </section>
+    </main>
+
+    <!-- Profiles area moved to bottom -->
+    <div id="profilesContainer" class="profiles-bottom">
+      <div style="color:var(--muted); font-size:13px;">Stored players:</div>
+      <div id="profilesList" style="display:flex; gap:8px; flex-wrap:wrap;"></div>
+      <div class="profiles-actions" style="margin-left:auto;">
+        <button id="clearSelectionBtn" class="btn secondary">Clear Selection</button>
+        <div style="color:var(--muted); font-size:13px;">Selected:</div>
+        <div id="selectedCount" style="font-weight:700; min-width:28px; text-align:center;">0</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Stats modal -->
+  <div id="statsModalBackdrop" class="modal-backdrop">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="statsModalTitle">
+      <h3 id="statsModalTitle">Player stats</h3>
+      <div id="statsContent">
+        <!-- populated dynamically -->
+      </div>
+      <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:12px;">
+        <button id="closeStatsBtn" class="btn secondary">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/js/board.js"></script>
+  <script>
+    // Application state
+    let currentGame = null;
+    let players = []; // players in current game (cards left column)
+    let profiles = []; // stored profiles from server
+    let selectedProfileIds = new Set();
+    let currentTurn = 0;
+    let throwsInVisit = 0;
+    let currentVisitHits = [];
+    let frozenLastVisitMarkers = null;
+
+    // Elements
+    const profilesListEl = document.getElementById('profilesList');
+    const selectedCountEl = document.getElementById('selectedCount');
+    const startBtn = document.getElementById('startGameBtn');
+    const endBtn = document.getElementById('endGameBtn');
+    const addProfileBtn = document.getElementById('addProfileBtn');
+    const newProfileNameEl = document.getElementById('newProfileName');
+    const clearSelectionBtn = document.getElementById('clearSelectionBtn');
+
+    // Fetch and render profiles (stored players)
+    async function fetchProfiles() {
+      const r = await fetch('/api/profiles');
+      profiles = await r.json();
+      renderProfiles();
+    }
+
+    function renderProfiles() {
+      profilesListEl.innerHTML = '';
+      profiles.forEach(p => {
+        const chip = document.createElement('div');
+        chip.className = 'profile-chip';
+        chip.dataset.id = p.id;
+        chip.innerHTML = `
+          <span class="profile-name">${escapeHtml(p.name)}</span>
+          <div style="display:flex; gap:6px; align-items:center;">
+            <button data-stats="${p.id}" title="View stats" class="btn btn-history">Stats</button>
+            <button data-edit="${p.id}" title="Rename" class="btn btn-history">Edit</button>
+            <button data-reset="${p.id}" title="Reset stats" class="btn btn-history">Reset</button>
+            <button data-del="${p.id}" title="Delete" class="btn btn-history">Delete</button>
+          </div>
+        `;
+        // clicking the chip toggles selection when no active game
+        chip.addEventListener('click', (ev) => {
+          // ignore clicks on action buttons
+          if (ev.target.closest('button')) return;
+          if (currentGame) return; // cannot change selection during active game
+          toggleProfileSelection(p.id);
+        });
+        profilesListEl.appendChild(chip);
+      });
+
+      // attach delegated handlers for action buttons
+      profilesListEl.querySelectorAll('[data-stats]').forEach(b => b.addEventListener('click', async (ev)=>{
+        ev.stopPropagation();
+        const id = b.getAttribute('data-stats');
+        await showProfileStats(id);
+      }));
+      profilesListEl.querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', async (ev)=>{
+        ev.stopPropagation();
+        const id = b.getAttribute('data-edit');
+        const prof = profiles.find(pp=>pp.id==id);
+        const newName = prompt('Rename player', prof ? prof.name : '');
+        if (newName && newName.trim()) {
+          const res = await fetch(`/api/profiles/${id}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:newName})});
+          if (res.ok) await fetchProfiles();
+          else {
+            const j = await res.json();
+            alert(j.error || 'Rename failed');
+          }
+        }
+      }));
+      profilesListEl.querySelectorAll('[data-reset]').forEach(b => b.addEventListener('click', async (ev)=>{
+        ev.stopPropagation();
+        const id = b.getAttribute('data-reset');
+        if (confirm('Reset this player stats? This deletes all stored throws for this profile.')) {
+          await fetch(`/api/profiles/${id}/reset`, {method:'POST'});
+          await fetchProfiles();
+        }
+      }));
+      profilesListEl.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', async (ev)=>{
+        ev.stopPropagation();
+        const id = b.getAttribute('data-del');
+        if (confirm('Delete this player? This removes profile and related stored stats.')) {
+          const res = await fetch(`/api/profiles/${id}`, {method:'DELETE'});
+          if (res.ok) {
+            // also remove from current selection if present
+            selectedProfileIds.delete(Number(id));
+            updateSelectedUI();
+            await fetchProfiles();
+          } else {
+            alert('Delete failed');
+          }
+        }
+      }));
+
+      updateSelectedUI();
+    }
+
+    function toggleProfileSelection(id) {
+      const num = Number(id);
+      if (selectedProfileIds.has(num)) selectedProfileIds.delete(num);
+      else {
+        if (selectedProfileIds.size >= 6) { alert('Maximum 6 players allowed'); return; }
+        selectedProfileIds.add(num);
+      }
+      updateSelectedUI();
+    }
+
+    function updateSelectedUI() {
+      // update chip visuals
+      document.querySelectorAll('#profilesList .profile-chip').forEach(ch => {
+        const id = Number(ch.dataset.id);
+        ch.classList.toggle('selected', selectedProfileIds.has(id));
+      });
+      selectedCountEl.innerText = selectedProfileIds.size;
+    }
+
+    addProfileBtn.addEventListener('click', async () => {
+      if (currentGame) { alert('Cannot add profiles while a game is active'); return; }
+      const name = newProfileNameEl.value.trim();
+      if (!name) return alert('Enter a name');
+      const res = await fetch('/api/profiles', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})});
+      if (res.ok) {
+        newProfileNameEl.value = '';
+        await fetchProfiles();
+      } else {
+        const j = await res.json();
+        alert(j.error || 'Failed to add');
+      }
+    });
+
+    clearSelectionBtn.addEventListener('click', () => {
+      if (currentGame) return;
+      selectedProfileIds.clear();
+      updateSelectedUI();
+    });
+
+    // Start/End game handling
+    startBtn.addEventListener('click', async () => {
+      if (currentGame) { alert('Game already running'); return; }
+      if (selectedProfileIds.size === 0) { alert('Select at least one player'); return; }
+      // Build payload: array of profile ids
+      const payloadPlayers = Array.from(selectedProfileIds);
+      const mode = document.getElementById('mode').value;
+      const res = await fetch('/api/new_game', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({mode, players: payloadPlayers})
+      });
+      const j = await res.json();
+      if (!res.ok) {
+        alert('Failed to start game');
+        return;
+      }
+      currentGame = j.game_id;
+      // lock profile interactions
+      lockProfileInteractions(true);
+      // reset turn state
+      currentTurn = 0;
+      throwsInVisit = 0;
+      currentVisitHits = [];
+      frozenLastVisitMarkers = null;
+      window.clearMarkers();
+      await loadState();
+      startBtn.disabled = true;
+      endBtn.disabled = false;
+    });
+
+    endBtn.addEventListener('click', async () => {
+      if (!currentGame) return;
+      if (!confirm('End current game?')) return;
+      // simply clear client state; game remains in DB but we allow new game creation
+      currentGame = null;
+      players = [];
+      document.getElementById('playersList').innerHTML = '';
+      lockProfileInteractions(false);
+      startBtn.disabled = false;
+      endBtn.disabled = true;
+      selectedProfileIds.clear();
+      updateSelectedUI();
+      window.clearMarkers();
+    });
+
+    function lockProfileInteractions(lock) {
+      // disable add button and make chips unselectable
+      addProfileBtn.disabled = lock;
+      newProfileNameEl.disabled = lock;
+      document.querySelectorAll('#profilesList .profile-chip').forEach(ch => {
+        if (lock) ch.classList.remove('clickable');
+      });
+    }
+
+    // Load current game state from server and render player cards left column
+    async function loadState() {
+      if (!currentGame) return;
+      const r = await fetch(`/api/game_state/${currentGame}`);
+      if (!r.ok) { console.warn('Failed to fetch game state'); return; }
+      const data = await r.json();
+      players = data.players || [];
+      renderPlayers(players);
+    }
+
+    function renderPlayers(pls) {
+      const playersDiv = document.getElementById('playersList');
+      playersDiv.innerHTML = '';
+      if (!pls.length) {
+        playersDiv.innerHTML = '<div style="color:var(--muted);">No active game. Select players below and click Start Game.</div>';
+        return;
+      }
+      // layout: for up to 3 players vertical; 4-6 two columns handled by CSS class
+      if (pls.length >= 4) playersDiv.classList.add('two-col'); else playersDiv.classList.remove('two-col');
+
+      pls.forEach((p, idx) => {
+        const div = document.createElement('div');
+        div.className = 'player-card';
+        div.id = `player-row-${p.id}`;
+        div.innerHTML = `
+          <div class="player-card-header">
+            <div class="player-name">${escapeHtml(p.name)}</div>
+            <div class="player-score">${p.current_score}</div>
+          </div>
+          <div class="player-card-body">
+            <div class="stat"><span class="label">Last visit:</span> <span class="value">${p.last_visit_score ?? 0}</span></div>
+            <div class="stat"><span class="label">Avg (3d):</span> <span class="value">${p.avg_3dart}</span></div>
+            <div class="stat"><span class="label">1st-9 avg (3d):</span> <span class="value">${p.first9_avg_3dart}</span></div>
+            <div class="stat"><span class="label">Throws:</span> <span class="value">${p.throw_count}</span></div>
+            <div class="checkout">
+              <div class="label">Checkout:</div>
+              <div class="checkout-value">${p.suggestion ? p.suggestion.join(' , ') : '-'}</div>
+            </div>
+          </div>
+          <div class="player-card-footer">
+            <button class="btn btn-select" onclick="jumpToPlayer(${idx})">Select</button>
+          </div>
+        `;
+        if (idx === currentTurn) div.classList.add('selected');
+        playersDiv.appendChild(div);
+      });
+      highlightActivePlayer();
+    }
+
+    function highlightActivePlayer(){
+      document.querySelectorAll('.player-card').forEach((el, i) => el.classList.toggle('selected', i === currentTurn));
+    }
+
+    function jumpToPlayer(index){
+      if (!players || !players.length) return;
+      currentTurn = index;
+      throwsInVisit = 0;
+      currentVisitHits = [];
+      frozenLastVisitMarkers = null;
+      window.clearMarkers();
+      highlightActivePlayer();
+    }
+
+    async function advanceToNextPlayer() {
+      if (currentVisitHits.length > 0) {
+        frozenLastVisitMarkers = currentVisitHits.slice();
+        window.showMarkers(frozenLastVisitMarkers, 'rgba(255,255,50,0.95)');
+      }
+      currentTurn = (currentTurn + 1) % players.length;
+      throwsInVisit = 0;
+      currentVisitHits = [];
+      highlightActivePlayer();
+      await loadState();
+    }
+
+    // Stats modal
+    const statsModal = document.getElementById('statsModalBackdrop');
+    const statsContent = document.getElementById('statsContent');
+    const closeStatsBtn = document.getElementById('closeStatsBtn');
+    closeStatsBtn.addEventListener('click', () => { statsModal.style.display = 'none'; });
+
+    async function showProfileStats(profileId) {
+      const res = await fetch(`/api/profiles/${profileId}/stats`);
+      if (!res.ok) {
+        alert('Failed to load stats');
+        return;
+      }
+      const d = await res.json();
+      statsContent.innerHTML = `
+        <div class="row"><div>Overall avg (3 darts)</div><div><strong>${d.overall_avg_3dart}</strong></div></div>
+        <div class="row"><div>Best 1st-9 avg (3d)</div><div><strong>${d.best_first9_avg_3dart}</strong></div></div>
+        <div class="row"><div>Overall 1st-9 avg (3d)</div><div><strong>${d.overall_first9_avg_3dart}</strong></div></div>
+        <div class="row"><div>Games played</div><div><strong>${d.count_games}</strong></div></div>
+        <div class="row"><div>Best game id (lowest throws)</div><div><strong>${d.best_game_id ?? '-'}</strong></div></div>
+        <div class="row"><div>Throws in best game</div><div><strong>${d.best_game_throws ?? '-'}</strong></div></div>
+        <div class="row"><div>Total thrown darts</div><div><strong>${d.overall_thrown_darts}</strong></div></div>
+      `;
+      statsModal.style.display = 'flex';
+    }
+
+    // Board interactions: when a click occurs board.js will call window.onDartHit
+    window.onDartHit = async function(segment) {
+      if (!currentGame) { alert('Start a game first.'); return; }
+      const curPlayer = players[currentTurn];
+      if (!curPlayer) { alert('No players'); return; }
+
+      // if start of visit and frozen markers exist, clear them
+      if (throwsInVisit === 0 && frozenLastVisitMarkers) {
+        frozenLastVisitMarkers = null;
+        window.clearMarkers();
+      }
+
+      // send throw payload including normalized coords (segment.x, segment.y exist if board reports them)
+      const payload = {
+        player_id: curPlayer.id,
+        value: segment.value,
+        multiplier: segment.multiplier,
+        x: segment.x,
+        y: segment.y
+      };
+      const res = await fetch('/api/throw', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(payload)
+      });
+      const j = await res.json();
+
+      // show current visit markers exactly where clicked
+      currentVisitHits.push({ value: segment.value, multiplier: segment.multiplier, label: segment.label, x: segment.x, y: segment.y });
+      window.showMarkers(currentVisitHits, 'rgba(32,201,151,0.95)');
+
+      throwsInVisit += 1;
+
+      if (j.status === 'bust' || j.status === 'winner') {
+        await advanceToNextPlayer();
+        return;
+      }
+      if (throwsInVisit >= 3) {
+        await advanceToNextPlayer();
+        return;
+      }
+      await loadState();
+    };
+
+    // board sizing & redraw - make sure bottom profiles remain visible
+    function resizeBoard() {
+      const canvas = document.getElementById('board');
+      const wrap = canvas.parentElement;
+      const size = Math.min(wrap.clientWidth - 36, window.innerHeight - 240);
+      canvas.width = size;
+      canvas.height = size;
+      if (typeof window.redrawBoard === 'function') window.redrawBoard();
+      if (frozenLastVisitMarkers) window.showMarkers(frozenLastVisitMarkers, 'rgba(255,255,50,0.95)');
+      if (currentVisitHits && currentVisitHits.length) window.showMarkers(currentVisitHits, 'rgba(32,201,151,0.95)');
+    }
+    window.addEventListener('resize', resizeBoard);
+
+    // Utility escape
+    function escapeHtml(s){ return String(s).replace(/[&<>"']/g, function(m){return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',\"'\":'&#39;'}[m]); }); }
+
+    // Init
+    (async function init(){
+      await fetchProfiles();
+      resizeBoard();
+    })();
+  </script>
+</body>
+</html>
