@@ -31,9 +31,10 @@ function ensureCanvas() {
   ctx = canvas && canvas.getContext ? canvas.getContext("2d") : null;
 }
 
-/* Default sizes until a real canvas is present */
-let W = 640;
-let H = 640;
+/* Default sizes until a real canvas is present.
+   Increased defaults to make the board larger by default. */
+let W = 1100;
+let H = 1100;
 let cx = W / 2;
 let cy = H / 2;
 
@@ -214,23 +215,61 @@ function playClickSoundSimple(kind = "normal", dur = 0.12) {
   }
 }
 
-/* Compute geometric sizes based on canvas size */
+/* Compute geometric sizes based on canvas size.
+   Use real-world mm measurements and map them to pixels so the treble/double/bull
+   bands have correct proportions relative to the board radius.
+
+   Real-world specs used (in mm):
+     - Outside of double fields to center (double outer radius): 170 mm
+     - Outer diameter of treble outer rim (treble outer radius): 107 mm
+     - Treble band height: 8 mm
+     - Double band height: 8 mm
+     - Bull outer diameter: 31.8 mm -> radius 15.9 mm
+     - Bull inner (bullseye) diameter: 12.7 mm -> radius 6.35 mm
+*/
 function computeSizes() {
   // Ensure we have a valid canvas/context reference before computing sizes.
   ensureCanvas();
   if (!canvas) return;
+
   W = canvas.width;
   H = canvas.height;
   cx = W / 2;
   cy = H / 2;
-  outerRadius = (Math.min(W, H) / 2) * 0.78;
-  tripleInner = outerRadius * 0.58;
-  tripleOuter = outerRadius * 0.66;
-  doubleInner = outerRadius * 0.88;
-  doubleOuter = outerRadius;
-  bullOuter = outerRadius * 0.06;
-  bullInner = outerRadius * 0.03;
-  OUTER_MISS_RING = outerRadius * 1.35;
+
+  // Use most of the available drawing area for the board (slightly larger footprint)
+  // so the board appears bigger in the layout.
+  // Increase fraction to make the overall board slightly larger relative to canvas.
+  const boardPixelRadius = (Math.min(W, H) / 2) * 0.92; // 92% of half-dimension
+
+  // Real-world mm values (adjusted sizes: band heights and bulls doubled for easier clicking)
+  const doubleOuterMm = 170.0;
+  const trebleOuterMm = 107.0;
+  // Double the band height to make the treble/double bands larger for improved hitability
+  const bandHeightMm = 16.0;
+  // Double bull radii (outer/inner) to make bulls and bullseye easier to hit
+  const bullOuterRadiusMm = 31.8; // doubled from 15.9 to 31.8 mm
+  const bullInnerRadiusMm = 12.7; // doubled from 6.35 to 12.7 mm
+
+  // Pixels-per-mm scale
+  const pxPerMm = boardPixelRadius / doubleOuterMm;
+
+  // Compute radii in pixels mapped from mm
+  doubleOuter = boardPixelRadius; // outer edge of double ring
+  doubleInner = doubleOuter - bandHeightMm * pxPerMm; // inner edge of double ring
+
+  tripleOuter = trebleOuterMm * pxPerMm; // outer edge of triple ring
+  tripleInner = tripleOuter - bandHeightMm * pxPerMm; // inner edge of triple ring
+
+  // Maintain an 'outerRadius' alias for legacy code (use the outermost useful board radius)
+  outerRadius = doubleOuter;
+
+  // Bulls (now doubled radii)
+  bullOuter = bullOuterRadiusMm * pxPerMm;
+  bullInner = bullInnerRadiusMm * pxPerMm;
+
+  // Miss ring slightly beyond doubles (larger margin for border)
+  OUTER_MISS_RING = doubleOuter + 20 * pxPerMm;
 }
 
 /* Rounded rectangle helper */
@@ -353,7 +392,8 @@ function drawBoard() {
 
     // number ring
     const mid = (start + end) / 2;
-    const numRadius = outerRadius + Math.max(14, W * 0.028);
+    // increase offset for number ring so the outer border/number area is more prominent
+    const numRadius = outerRadius + Math.max(24, W * 0.036);
     const tx = cx + Math.cos(mid) * numRadius;
     const ty = cy + Math.sin(mid) * numRadius;
     const padX = Math.max(6, Math.floor(W / 140));
@@ -396,13 +436,15 @@ function drawBoard() {
   ctx.beginPath();
   ctx.arc(cx, cy, OUTER_MISS_RING, 0, Math.PI * 2);
   ctx.strokeStyle = "rgba(255,255,255,0.06)";
-  ctx.lineWidth = Math.max(3, Math.floor(W / 160));
+  // slightly thicker stroke for clearer border at larger sizes
+  ctx.lineWidth = Math.max(4, Math.floor(W / 140));
   ctx.stroke();
 
   ctx.beginPath();
   ctx.arc(cx, cy, OUTER_MISS_RING, 0, Math.PI * 2);
   ctx.strokeStyle = "rgba(255,255,50,0.025)";
-  ctx.lineWidth = Math.max(12, Math.floor(W / 60));
+  // increase the glow ring width for better visual presence when board is larger
+  ctx.lineWidth = Math.max(16, Math.floor(W / 50));
   ctx.stroke();
 
   // markers (drawn under zoom transform)
@@ -437,7 +479,8 @@ function hitToCoord(hit) {
   if (hit.multiplier === 3) r = (tripleInner + tripleOuter) / 2;
   else if (hit.multiplier === 2) r = (doubleInner + doubleOuter) / 2;
   else if (hit.multiplier === 1)
-    r = (tripleOuter + doubleInner) / 2 - outerRadius * 0.03;
+    // place single hits midway between triple outer and double inner for consistent geometry
+    r = (tripleOuter + doubleInner) / 2;
   else r = OUTER_MISS_RING;
   const x = cx + Math.cos(mid) * r;
   const y = cy + Math.sin(mid) * r;
