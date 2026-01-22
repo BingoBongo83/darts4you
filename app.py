@@ -52,10 +52,79 @@ class Throw(db.Model):
 
 # Ensure tables exist
 with app.app_context():
+    # Create any missing tables from the current models
     db.create_all()
+
+    # Runtime compatibility step for older SQLite databases:
+    # If the DB was created with an older schema it may be missing the
+    # `profile_id` columns on `player` and `throw`. SQLite supports
+    # adding simple columns via ALTER TABLE ... ADD COLUMN, so attempt
+    # to add them if they're absent. We swallow errors so the app can
+    # still start even if this compatibility step can't run for some reason.
+    #
+    # Note: this does not (and cannot, easily) add foreign-key constraints
+    # to an existing SQLite table; it only adds the integer column so the
+    # ORM can read/write it going forward.
+    try:
+        engine = db.get_engine()
+        if engine.dialect.name == "sqlite":
+            conn = engine.connect()
+            try:
+
+                def _has_column(table, col):
+                    # PRAGMA table_info returns rows like: (cid, name, type, notnull, dflt_value, pk)
+                    res = conn.execute(f"PRAGMA table_info('{table}')").fetchall()
+                    return any(row[1] == col for row in res)
+
+                if not _has_column("player", "profile_id"):
+                    conn.execute("ALTER TABLE player ADD COLUMN profile_id INTEGER")
+                if not _has_column("throw", "profile_id"):
+                    # The table name 'throw' is simple, but quote it to be safe
+                    conn.execute('ALTER TABLE "throw" ADD COLUMN profile_id INTEGER')
+            finally:
+                conn.close()
+    except Exception:
+        # If anything goes wrong here we intentionally ignore it so the
+        # application can continue using the existing DB. The error can
+        # be investigated separately (logs/console) if needed.
+        pass
 
 
 # Helpers
+def ensure_profile_columns():
+    """
+    Ensure `profile_id` integer columns exist on `player` and `throw` tables for older SQLite DBs.
+    This is a no-op on non-SQLite databases. We keep this defensive and swallow errors so that
+    startup or request handling doesn't crash because of ALTER TABLE failures — such failures
+    should be investigated and fixed with proper migrations in production.
+    """
+    try:
+        try:
+            engine = db.get_engine()
+        except Exception:
+            engine = db.engine
+        # Only run for SQLite
+        if engine and getattr(engine, "dialect", None) and engine.dialect.name == "sqlite":
+            conn = engine.connect()
+            try:
+
+                def _has_column(table, col):
+                    # Use PRAGMA to inspect columns: returns rows like (cid, name, type, notnull, dflt_value, pk)
+                    res = conn.execute(text(f"PRAGMA table_info('{table}')")).fetchall()
+                    return any(row[1] == col for row in res)
+
+                if not _has_column("player", "profile_id"):
+                    conn.execute(text("ALTER TABLE player ADD COLUMN profile_id INTEGER"))
+                if not _has_column("throw", "profile_id"):
+                    conn.execute(text('ALTER TABLE "throw" ADD COLUMN profile_id INTEGER'))
+            finally:
+                conn.close()
+    except Exception:
+        # Intentionally ignore and let the request handling surface errors if needed.
+        # Use proper migrations (Flask-Migrate/Alembic) for long-term safety.
+        pass
+
+
 def profile_to_dict(p: Profile):
     return {"id": p.id, "name": p.name, "created_at": p.created_at.isoformat()}
 
@@ -80,10 +149,18 @@ def profiles():
         existing = Profile.query.filter_by(name=name).first()
         if existing:
             return jsonify({"error": "Profile name already exists", "id": existing.id}), 400
-        p = Profile(name=name)
-        db.session.add(p)
-        db.session.commit()
-        return jsonify(profile_to_dict(p)), 201
+        try:
+            p = Profile(name=name)
+            db.session.add(p)
+            db.session.commit()
+            return jsonify(profile_to_dict(p)), 201
+        except Exception as e:
+            # rollback any partial transaction and return a JSON error
+            try:
+                db.session.rollback()
+            except:
+                pass
+            return jsonify({"error": "Failed to create profile", "details": str(e)}), 500
 
 
 @app.route("/api/profiles/<int:profile_id>", methods=["PATCH", "DELETE"])
@@ -196,38 +273,169 @@ def profile_stats(profile_id):
 @app.route("/api/new_game", methods=["POST"])
 def new_game():
     payload = request.json or {}
-    mode = payload.get("mode", "501")
-    players_input = payload.get("players", [])  # expected list of profile ids OR names
-    players_input = players_input[:6]
-    starting = 501 if mode in ("501", "301") else 0
-    if mode == "301":
+    # Ensure schema is compatible before creating Player rows (helps with older SQLite DBs)
+    ensure_profile_columns()
+
+    # Diagnostic container to capture SQLite table_info (populated when possible)
+    _schema_diag = {}
+    try:
+        # Try to gather schema info up-front for easier diagnostics if an error occurs.
+        try:
+            engine = db.get_engine()
+        except Exception:
+            engine = db.engine
+
+        if engine and getattr(engine, "dialect", None) and engine.dialect.name == "sqlite":
+            conn = None
+            try:
+                conn = engine.connect()
+                try:
+                    res_p = conn.execute(text("PRAGMA table_info('player')")).fetchall()
+                    res_t = conn.execute(text("PRAGMA table_info('throw')")).fetchall()
+                    _schema_diag["player"] = [r[1] for r in res_p]
+                    _schema_diag["throw"] = [r[1] for r in res_t]
+                    app.logger.debug("Schema diagnostic - player columns: %s", _schema_diag["player"])
+                    app.logger.debug("Schema diagnostic - throw columns: %s", _schema_diag["throw"])
+                except Exception as inner_pr:
+                    # If PRAGMA fails, record the exception message
+                    _schema_diag["error"] = f"failed to read PRAGMA: {inner_pr}"
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        mode = payload.get("mode", "501")
+        players_input = payload.get("players", [])  # expected list of profile ids OR names
+        players_input = players_input[:6]
+        starting = 501 if mode in ("501", "301") else 0
+        if mode == "301":
+            starting = 301
+        game = Game(mode=mode)
+        db.session.add(game)
+        db.session.flush()
+        created_players = []
+        for p in players_input:
+            profile = None
+            name = None
+            if isinstance(p, dict):
+                if "profile_id" in p:
+                    profile = Profile.query.get(p["profile_id"])
+                name = p.get("name") or (profile.name if profile else "Player")
+            elif isinstance(p, int):
+                profile = Profile.query.get(p)
+                name = profile.name if profile else f"Player {p}"
+            elif isinstance(p, str):
+                name = p
+                profile = Profile.query.filter_by(name=name).first()
+            else:
+                name = "Player"
+            pl = Player(name=name, starting_score=starting, current_score=starting, game_id=game.id)
+            if profile:
+                pl.profile_id = profile.id
+            db.session.add(pl)
+            created_players.append({"id": pl.id, "name": name, "profile_id": pl.profile_id})
+        db.session.commit()
+        return jsonify({"game_id": game.id, "players_created": created_players})
+    except Exception as e:
+        # On error, ensure the transaction is rolled back and return a JSON error payload
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+
+        # Attempt to capture schema again at the moment of error if we don't already have it
+        try:
+            engine = db.get_engine()
+        except Exception:
+            engine = db.engine
+
+        if (not _schema_diag) and engine and getattr(engine, "dialect", None) and engine.dialect.name == "sqlite":
+            try:
+                conn = engine.connect()
+                try:
+                    res_p = conn.execute(text("PRAGMA table_info('player')")).fetchall()
+                    res_t = conn.execute(text("PRAGMA table_info('throw')")).fetchall()
+                    _schema_diag["player"] = [r[1] for r in res_p]
+                    _schema_diag["throw"] = [r[1] for r in res_t]
+                except Exception as inner_pr:
+                    _schema_diag["error"] = f"failed to read PRAGMA at exception time: {inner_pr}"
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            except Exception:
+                # If even attempting to connect fails, note that
+                _schema_diag["error"] = _schema_diag.get("error", "") + " (could not connect to engine for PRAGMA)"
+
+        tb = traceback.format_exc()
+        # Include schema diagnostics in the response to help debugging missing-column errors
+        resp = {"error": "Failed to create game", "details": str(e), "trace": tb}
+        if _schema_diag:
+            resp["schema_diagnostics"] = _schema_diag
+        return jsonify(resp), 500
+
+
+# API: add a player (by profile or name) to an existing game
+@app.route("/api/games/<int:game_id>/add_player", methods=["POST"])
+def add_player_to_game(game_id):
+    """
+    Accepts JSON:
+      { "profile_id": <int> }       # attach existing profile to the game
+    or
+      { "name": "<Player name>" }   # create a game-only player (or use profile if found)
+    Returns 201 with created player info, or 4xx on error.
+    """
+    # Ensure schema is compatible before touching player/throw rows (helps with older SQLite DBs)
+    ensure_profile_columns()
+    game = Game.query.get_or_404(game_id)
+    data = request.json or {}
+
+    # limit players per game to 6
+    if len(game.players) >= 6:
+        return jsonify({"error": "Game already has maximum number of players (6)"}), 400
+
+    profile = None
+    profile_id = data.get("profile_id")
+    name = data.get("name")
+
+    if profile_id is not None:
+        try:
+            profile_id = int(profile_id)
+        except Exception:
+            return jsonify({"error": "Invalid profile_id"}), 400
+        profile = Profile.query.get(profile_id)
+        if not profile:
+            return jsonify({"error": "Profile not found"}), 404
+        # prefer provided name, otherwise profile name
+        name = name or profile.name
+
+    # If a name is provided but matches an existing profile and no explicit profile_id, link it
+    if profile is None and name:
+        existing = Profile.query.filter_by(name=name).first()
+        if existing:
+            profile = existing
+
+    # fallback name
+    if not name:
+        name = "Player"
+
+    # determine starting score based on game mode
+    starting = 501 if game.mode in ("501", "301") else 0
+    if game.mode == "301":
         starting = 301
-    game = Game(mode=mode)
-    db.session.add(game)
-    db.session.flush()
-    created_players = []
-    for p in players_input:
-        profile = None
-        name = None
-        if isinstance(p, dict):
-            if "profile_id" in p:
-                profile = Profile.query.get(p["profile_id"])
-            name = p.get("name") or (profile.name if profile else "Player")
-        elif isinstance(p, int):
-            profile = Profile.query.get(p)
-            name = profile.name if profile else f"Player {p}"
-        elif isinstance(p, str):
-            name = p
-            profile = Profile.query.filter_by(name=name).first()
-        else:
-            name = "Player"
-        pl = Player(name=name, starting_score=starting, current_score=starting, game_id=game.id)
-        if profile:
-            pl.profile_id = profile.id
-        db.session.add(pl)
-        created_players.append({"id": pl.id, "name": name, "profile_id": pl.profile_id})
+
+    pl = Player(name=name, starting_score=starting, current_score=starting, game_id=game.id)
+    if profile:
+        pl.profile_id = profile.id
+
+    db.session.add(pl)
     db.session.commit()
-    return jsonify({"game_id": game.id, "players_created": created_players})
+
+    created = {"id": pl.id, "name": pl.name, "profile_id": pl.profile_id, "current_score": pl.current_score}
+    return jsonify({"player": created}), 201
 
 
 # Game state (includes per-player last visit hits and stats)

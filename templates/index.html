@@ -130,6 +130,28 @@
     </div>
   </div>
 
+  <!-- Start Game modal (shown when user clicks Add to game with no active game) -->
+  <div id="startGameModalBackdrop" class="modal-backdrop">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="startGameModalTitle">
+      <h3 id="startGameModalTitle">Start new game?</h3>
+      <div id="startGameContent">
+        <div class="row"><div>Player to add:</div><div><strong id="startPlayerName">-</strong></div></div>
+        <div class="row"><div>Mode</div><div>
+          <select id="startModeSelect">
+            <option value="501">501</option>
+            <option value="301">301</option>
+            <option value="cricket">Cricket</option>
+            <option value="around">Around the Clock</option>
+          </select>
+        </div></div>
+      </div>
+      <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:12px;">
+        <button id="startCancelBtn" class="btn secondary">Cancel</button>
+        <button id="startConfirmBtn" class="btn">Start & Add</button>
+      </div>
+    </div>
+  </div>
+
   <script src="/static/js/board.js"></script>
   <script>
     // Application state
@@ -141,6 +163,7 @@
     let throwsInVisit = 0;
     let currentVisitHits = [];
     let frozenLastVisitMarkers = null;
+    let pendingProfileToAutoAdd = null;
 
     // Elements
     const profilesListEl = document.getElementById('profilesList');
@@ -170,6 +193,7 @@
             <button data-stats="${p.id}" title="View stats" class="btn btn-history">Stats</button>
             <button data-edit="${p.id}" title="Rename" class="btn btn-history">Edit</button>
             <button data-reset="${p.id}" title="Reset stats" class="btn btn-history">Reset</button>
+            <button data-add="${p.id}" title="Add to game" class="btn btn-history">Add to game</button>
             <button data-del="${p.id}" title="Delete" class="btn btn-history">Delete</button>
           </div>
         `;
@@ -211,6 +235,42 @@
           await fetchProfiles();
         }
       }));
+      // Add-to-game handler: attempts to add this profile to the currently active game.
+      // If no game is active, ask the user whether to start a new game (modal) and then auto-start and add.
+      profilesListEl.querySelectorAll('[data-add]').forEach(b => b.addEventListener('click', async (ev)=>{
+        ev.stopPropagation();
+        const id = Number(b.getAttribute('data-add'));
+        if (!currentGame) {
+          // Find profile name for modal display
+          const prof = profiles.find(pp => pp.id === id);
+          document.getElementById('startPlayerName').innerText = prof ? prof.name : `#${id}`;
+          pendingProfileToAutoAdd = id;
+          // default modal mode to the main mode selector value
+          const mainMode = document.getElementById('mode') ? document.getElementById('mode').value : '501';
+          document.getElementById('startModeSelect').value = mainMode || '501';
+          document.getElementById('startGameModalBackdrop').style.display = 'flex';
+          return;
+        }
+        try {
+          const res = await fetch(`/api/games/${currentGame}/add_player`, {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({profile_id: id})
+          });
+          if (res.ok) {
+            // refresh game state and profile list
+            await loadState();
+            await fetchProfiles();
+          } else {
+            let j = null;
+            try { j = await res.json(); } catch(e) {}
+            alert((j && j.error) || 'Failed to add player to game');
+          }
+        } catch (err) {
+          console.error('Error adding profile to game:', err);
+          alert('Network error while adding player to game');
+        }
+      }));
       profilesListEl.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', async (ev)=>{
         ev.stopPropagation();
         const id = b.getAttribute('data-del');
@@ -250,18 +310,39 @@
     }
 
     addProfileBtn.addEventListener('click', async () => {
-      if (currentGame) { alert('Cannot add profiles while a game is active'); return; }
-      const name = newProfileNameEl.value.trim();
-      if (!name) return alert('Enter a name');
-      const res = await fetch('/api/profiles', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})});
-      if (res.ok) {
-        newProfileNameEl.value = '';
-        await fetchProfiles();
-      } else {
-        const j = await res.json();
-        alert(j.error || 'Failed to add');
-      }
-    });
+          if (currentGame) { alert('Cannot add profiles while a game is active'); return; }
+          const name = newProfileNameEl.value.trim();
+          if (!name) { alert('Enter a name'); return; }
+          addProfileBtn.disabled = true;
+          try {
+            const res = await fetch('/api/profiles', {
+              method: 'POST',
+              headers: {'Content-Type':'application/json'},
+              body: JSON.stringify({name})
+            });
+            if (res.ok) {
+              newProfileNameEl.value = '';
+              await fetchProfiles();
+            } else {
+              // Try to parse JSON error body if possible, otherwise fallback
+              let errMsg = 'Failed to add player';
+              try {
+                const j = await res.json();
+                if (j && j.error) errMsg = j.error;
+              } catch (parseErr) {
+                console.error('Failed to parse error response from /api/profiles', parseErr);
+              }
+              console.error('Create profile returned non-OK response', res.status, res.statusText);
+              alert(errMsg);
+            }
+          } catch (err) {
+            // Network or unexpected error
+            console.error('Unexpected error while creating profile:', err);
+            alert('Network or internal error while adding player. See console for details.');
+          } finally {
+            addProfileBtn.disabled = false;
+          }
+        });
 
     clearSelectionBtn.addEventListener('click', () => {
       if (currentGame) return;
@@ -281,11 +362,32 @@
         headers: {'Content-Type':'application/json'},
         body: JSON.stringify({mode, players: payloadPlayers})
       });
-      const j = await res.json();
+
+      // Some server errors may return non-JSON (HTML error page). Try to parse JSON,
+      // but fall back to plain text so we can show useful error details to the user.
+      let j = null;
+      try {
+        j = await res.json();
+      } catch (parseErr) {
+        // response is not JSON - capture text body for diagnostics
+        try {
+          const txt = await res.text();
+          j = { error: txt };
+        } catch (txtErr) {
+          j = { error: 'Non-JSON error response (and failed to read body)' };
+        }
+      }
+
       if (!res.ok) {
-        alert('Failed to start game');
+        // Prefer structured error fields when available, otherwise show the plain text body
+        const errMsg = (j && (j.error || j.details || j.message)) ? (j.error || j.details || j.message) : 'Failed to start game';
+        // Trim very large HTML responses for the alert but log full details to console
+        const shown = String(errMsg).slice(0, 1000);
+        alert('Failed to start game: ' + shown);
+        console.error('Start game failed', { status: res.status, statusText: res.statusText, body: j });
         return;
       }
+
       currentGame = j.game_id;
       // lock profile interactions
       lockProfileInteractions(true);
@@ -405,6 +507,68 @@
     const closeStatsBtn = document.getElementById('closeStatsBtn');
     closeStatsBtn.addEventListener('click', () => { statsModal.style.display = 'none'; });
 
+    // Start-Game modal (for auto-start when adding a profile with no active game)
+    const startGameModal = document.getElementById('startGameModalBackdrop');
+    const startPlayerNameEl = document.getElementById('startPlayerName');
+    const startModeSelect = document.getElementById('startModeSelect');
+    const startConfirmBtn = document.getElementById('startConfirmBtn');
+    const startCancelBtn = document.getElementById('startCancelBtn');
+
+    // pendingProfileToAutoAdd holds the profile id of the click that triggered the modal
+    // (we set it above when showing the modal)
+    // let pendingProfileToAutoAdd = null;  (declared earlier alongside other globals)
+
+    startCancelBtn.addEventListener('click', () => {
+      pendingProfileToAutoAdd = null;
+      startGameModal.style.display = 'none';
+    });
+
+    startConfirmBtn.addEventListener('click', async () => {
+      if (!pendingProfileToAutoAdd) return;
+      startConfirmBtn.disabled = true;
+      const selectedMode = startModeSelect.value || (document.getElementById('mode') ? document.getElementById('mode').value : '501');
+      try {
+        // Start a new game with the clicked profile as the sole initial player
+        const res = await fetch('/api/new_game', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ mode: selectedMode, players: [pendingProfileToAutoAdd] })
+        });
+
+        // Try to parse JSON response safely
+        let body = null;
+        try { body = await res.json(); } catch (e) { body = null; }
+
+        if (!res.ok) {
+          const errMsg = body && (body.error || body.details) ? (body.error || body.details) : 'Failed to start game';
+          alert('Failed to start game: ' + String(errMsg).slice(0, 1000));
+          console.error('Start game failed', { status: res.status, body });
+          return;
+        }
+
+        // Success: set currentGame and load state
+        currentGame = body.game_id;
+        lockProfileInteractions(true);
+        currentTurn = 0;
+        throwsInVisit = 0;
+        currentVisitHits = [];
+        frozenLastVisitMarkers = null;
+        window.clearMarkers();
+        await loadState();
+        startBtn.disabled = true;
+        endBtn.disabled = false;
+        // refresh profiles (in case UI needs update)
+        await fetchProfiles();
+      } catch (err) {
+        console.error('Failed to auto-start game', err);
+        alert('Network error while starting game');
+      } finally {
+        startConfirmBtn.disabled = false;
+        pendingProfileToAutoAdd = null;
+        startGameModal.style.display = 'none';
+      }
+    });
+
     async function showProfileStats(profileId) {
       const res = await fetch(`/api/profiles/${profileId}/stats`);
       if (!res.ok) {
@@ -482,7 +646,7 @@
     window.addEventListener('resize', resizeBoard);
 
     // Utility escape
-    function escapeHtml(s){ return String(s).replace(/[&<>"']/g, function(m){return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',\"'\":'&#39;'}[m]); }); }
+    function escapeHtml(s){ return String(s).replace(/[&<>"']/g, function(m){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;', "'":'&#39;'}[m]); }); }
 
     // Init
     (async function init(){
