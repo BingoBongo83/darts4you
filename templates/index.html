@@ -657,70 +657,162 @@
       window.clearMarkers();
     });
 
-    // Restart game button: call server restart endpoint then reload and re-enable the active game UI.
-    // This resets scores and leg/ set counters server-side (if implemented) and keeps the game active.
-    restartGameBtn.addEventListener('click', async () => {
-      if (!currentGame) return;
-      if (!confirm('Restart current game (reset scores and leg/sets)?')) return;
+     // Restart game button: call server restart endpoint then reload and re-enable the active game UI.
+        // This resets scores and leg/ set counters server-side (if implemented) and keeps the game active.
+        restartGameBtn.addEventListener('click', async () => {
+          if (!currentGame) return;
+          if (!confirm('Restart current game (reset scores and leg/sets)?')) return;
 
-      // Try to call server restart endpoint. If it returns 404 we fallback to client-side reset.
-      // If it returns another error we surface it to the user and abort so we don't silently fail.
-      let serverRestarted = false;
-      try {
-        const res = await fetch(`/api/games/${currentGame}/restart`, { method: 'POST' });
-        if (res.ok) {
-          serverRestarted = true;
-        } else if (res.status === 404) {
-          console.warn('restart endpoint not implemented on server (404). Performing client-side restart fallback.');
-        } else {
-          // Try to extract server error details
-          let bodyStr = '';
-          try { bodyStr = await res.text(); } catch (e) { bodyStr = String(e); }
-          let msg = `Server returned ${res.status} ${res.statusText}`;
-          if (bodyStr) {
+          // Try to call server restart endpoint. If it returns 404 we fallback to client-side reset.
+          // If it returns another error we surface it to the user and abort so we don't silently fail.
+          let serverRestarted = false;
+          let fallbackPerformed = false;
+          try {
+            const res = await fetch(`/api/games/${currentGame}/restart`, { method: 'POST' });
+            if (res.ok) {
+              serverRestarted = true;
+            } else if (res.status === 404) {
+              console.warn('restart endpoint not implemented on server (404). Performing client-side restart fallback.');
+              // Perform client-side restart: reset player scores to their starting scores and clear counters/visits locally.
+              try {
+                // Ensure players array exists
+                players = players || [];
+                players.forEach(p => {
+                  try {
+                    // Reset logical fields
+                    p.current_score = p.starting_score;
+                    // zero counters if present
+                    if (typeof p.leg_wins !== 'undefined') p.leg_wins = 0;
+                    if (typeof p.set_wins !== 'undefined') p.set_wins = 0;
+                    // Update DOM score display if rendered
+                    const scoreEl = document.querySelector(`#player-row-${p.id} .player-score`);
+                    if (scoreEl) scoreEl.textContent = String(p.current_score);
+                    // Clear visit display for this player
+                    if (window._updateVisitDisplayForPlayer) {
+                      try { window._updateVisitDisplayForPlayer(p.id, []); } catch (e) { /* ignore */ }
+                    }
+                  } catch (e) {
+                    console.warn('Failed to reset player locally during restart fallback', p && p.id, e);
+                  }
+                });
+
+                // Clear ephemeral visit/marker state
+                try {
+                  throwsInVisit = 0;
+                  currentVisitHits = [];
+                  frozenLastVisitMarkers = null;
+                  if (typeof window.clearMarkers === 'function') window.clearMarkers();
+                  // Ensure visit DOM slots are cleared for all players
+                  if (typeof window._clearAllVisitDisplays === 'function') {
+                    try { window._clearAllVisitDisplays(); } catch (e) { /* ignore */ }
+                  }
+                } catch (e) {
+                  console.warn('Failed to clear local ephemeral state during restart fallback', e);
+                }
+
+                // Reset active turn locally to a safe default (0). If desired, attempt to persist to server (best-effort).
+                currentTurn = 0;
+                highlightActivePlayer();
+                try {
+                  if (currentGame !== null) {
+                    fetch(`/api/games/${currentGame}/set_active`, {
+                      method: 'POST',
+                      headers: {'Content-Type':'application/json'},
+                      body: JSON.stringify({ active_index: currentTurn })
+                    }).catch(()=>{});
+                  }
+                } catch (e) { /* best-effort only */ }
+
+                // Indicate fallback was performed so we can avoid reloading server state that will be unchanged.
+                fallbackPerformed = true;
+              } catch (e) {
+                console.warn('Client-side restart fallback failed', e);
+              }
+            } else {
+              // Try to extract server error details
+              let bodyStr = '';
+              try { bodyStr = await res.text(); } catch (e) { bodyStr = String(e); }
+              let msg = `Server returned ${res.status} ${res.statusText}`;
+              if (bodyStr) {
+                try {
+                  const j = JSON.parse(bodyStr);
+                  if (j && (j.error || j.details)) msg += `: ${j.error || j.details}`;
+                  else msg += `: ${bodyStr.slice(0,500)}`;
+                } catch (e) {
+                  msg += `: ${bodyStr.slice(0,500)}`;
+                }
+              }
+              alert('Failed to restart game on server: ' + msg);
+              return; // abort to avoid silent fallback on unexpected server error
+            }
+          } catch (e) {
+            // Network error: surface to user and abort (no silent fallback)
+            const emsg = e && e.message ? e.message : String(e);
+            alert('Network error while trying to restart game: ' + emsg);
+            return;
+          }
+
+          // If server handled restart we still need to clear ephemeral client state so the UI reflects a fresh leg start.
+          if (!fallbackPerformed) {
             try {
-              const j = JSON.parse(bodyStr);
-              if (j && (j.error || j.details)) msg += `: ${j.error || j.details}`;
-              else msg += `: ${bodyStr.slice(0,500)}`;
+              // Clear markers and ephemeral visit state
+              if (typeof window.clearMarkers === 'function') window.clearMarkers();
+              throwsInVisit = 0;
+              currentVisitHits = [];
+              frozenLastVisitMarkers = null;
+              // Clear visit DOM slots so previous throws are not visible
+              if (typeof window._clearAllVisitDisplays === 'function') {
+                try { window._clearAllVisitDisplays(); } catch (e) { /* ignore */ }
+              } else {
+                // Fallback: iterate players and clear visit slots via updater if available
+                try {
+                  players = players || [];
+                  players.forEach(p => {
+                    try { if (window._updateVisitDisplayForPlayer) window._updateVisitDisplayForPlayer(p.id, []); } catch (e) {}
+                  });
+                } catch (e) {}
+              }
             } catch (e) {
-              msg += `: ${bodyStr.slice(0,500)}`;
+              console.warn('Failed to clear local ephemeral state during restart', e);
             }
           }
-          alert('Failed to restart game on server: ' + msg);
-          return; // abort to avoid silent fallback on unexpected server error
-        }
-      } catch (e) {
-        // Network error: surface to user and abort (no silent fallback)
-        const emsg = e && e.message ? e.message : String(e);
-        alert('Network error while trying to restart game: ' + emsg);
-        return;
-      }
 
-      // If server did not handle restart (404), or if it did, we still need to clear ephemeral client state
-      // so the UI reflects a fresh leg start.
-      try {
-        window.clearMarkers();
-        throwsInVisit = 0;
-        currentVisitHits = [];
-        frozenLastVisitMarkers = null;
-      } catch (e) {
-        console.warn('Failed to clear local ephemeral state during restart', e);
-      }
+          // Ensure UI reflects an active game after restart
+          startBtn.disabled = true;
+          restartGameBtn.disabled = false;
+          endBtn.disabled = false;
+          lockProfileInteractions(true);
 
-      // Ensure UI reflects an active game after restart
-      startBtn.disabled = true;
-      restartGameBtn.disabled = false;
-      endBtn.disabled = false;
-      lockProfileInteractions(true);
-
-      // reload authoritative state from server (preserve our locally-decided currentTurn)
-      try {
-        await loadState(true);
-      } catch (e) {
-        console.warn('loadState failed after restart', e);
-        // If loadState fails but we did perform a restart, keep the UI in a consistent client-side state.
-      }
-    });
+          // If server restarted the game, reload authoritative state from server (preserve our locally-decided currentTurn)
+          if (serverRestarted) {
+            try {
+              await loadState(true);
+              // After reloading authoritative state, ensure visit displays/markers remain cleared in the UI
+              try {
+                throwsInVisit = 0;
+                currentVisitHits = [];
+                frozenLastVisitMarkers = null;
+                if (typeof window.clearMarkers === 'function') window.clearMarkers();
+                if (typeof window._clearAllVisitDisplays === 'function') {
+                  try { window._clearAllVisitDisplays(); } catch (e) { /* ignore */ }
+                } else {
+                  players = players || [];
+                  players.forEach(p => {
+                    try { if (window._updateVisitDisplayForPlayer) window._updateVisitDisplayForPlayer(p.id, []); } catch (e) {}
+                  });
+                }
+              } catch (e) {
+                console.warn('Failed to re-clear visit displays after loadState', e);
+              }
+            } catch (e) {
+              console.warn('loadState failed after restart', e);
+              // If loadState fails but we did perform a restart, keep the UI in a consistent client-side state.
+            }
+          } else if (fallbackPerformed) {
+            // We performed a client-side restart fallback; refresh the profiles UI so selection/metadata stays consistent.
+            try { await fetchProfiles(); } catch (e) { /* best-effort */ }
+          }
+        });
 
     function lockProfileInteractions(lock) {
       // disable add button and make chips unselectable

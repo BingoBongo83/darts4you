@@ -1,3 +1,4 @@
+import logging
 import os
 import random
 import traceback
@@ -10,6 +11,11 @@ from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
 from checkout import find_checkout
+
+# Basic logging setup for debugging endpoints and important events.
+# In production you may wish to configure logging differently (file handler, level via env, etc).
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 base_dir = os.path.abspath(os.path.dirname(__file__))
@@ -841,47 +847,78 @@ def restart_game(game_id):
     reset per-player leg_wins/set_wins counters to zero, reset current_set/current_leg
     to the beginning and mark the game as active (finished=False).
     """
-    game = Game.query.get_or_404(game_id)
+    logger.info("Restart requested for game id=%s", game_id)
+    try:
+        game = Game.query.get_or_404(game_id)
 
-    # Reset per-player scores and counters
-    for pl in game.players:
-        pl.current_score = pl.starting_score
+        logger.info("Resetting %d players for game id=%s", len(game.players or []), game_id)
+        # Reset per-player scores and counters
+        for pl in game.players:
+            pl.current_score = pl.starting_score
+            try:
+                pl.leg_wins = 0
+            except Exception:
+                # older DBs may not have these columns; ignore if absent
+                logger.debug("Player %s missing leg_wins column", getattr(pl, "id", "<unknown>"))
+                pass
+            try:
+                pl.set_wins = 0
+            except Exception:
+                logger.debug("Player %s missing set_wins column", getattr(pl, "id", "<unknown>"))
+                pass
+            db.session.add(pl)
+
+        # Reset game-level counters and mark active
         try:
-            pl.leg_wins = 0
+            game.current_set = 1
         except Exception:
-            # older DBs may not have these columns; ignore if absent
+            logger.debug("Game missing current_set column")
             pass
         try:
-            pl.set_wins = 0
+            game.current_leg = 1
         except Exception:
+            logger.debug("Game missing current_leg column")
             pass
-        db.session.add(pl)
+        try:
+            game.current_start_index = 0
+        except Exception:
+            logger.debug("Game missing current_start_index column")
+            pass
 
-    # Reset game-level counters and mark active
-    try:
-        game.current_set = 1
-    except Exception:
-        pass
-    try:
-        game.current_leg = 1
-    except Exception:
-        pass
-    try:
-        game.current_start_index = 0
-    except Exception:
-        pass
+        # reset active player index to the starting index on restart
+        try:
+            game.current_active_index = getattr(game, "current_start_index", 0)
+        except Exception:
+            game.current_active_index = 0
 
-    # reset active player index to the starting index on restart
-    try:
-        game.current_active_index = getattr(game, "current_start_index", 0)
-    except Exception:
-        game.current_active_index = 0
+        game.finished = False
 
-    game.finished = False
+        # Remove any Throw rows for players in this game so last-visit UI clears.
+        # This ensures that after a restart there are no lingering throws shown as the
+        # player's "last visit". Use a bulk delete for efficiency and avoid loading rows.
+        try:
+            player_ids = [p.id for p in (game.players or []) if getattr(p, "id", None) is not None]
+            if player_ids:
+                Throw.query.filter(Throw.player_id.in_(player_ids)).delete(synchronize_session=False)
+        except Exception:
+            logger.exception("Failed to delete throws for game id=%s during restart", game_id)
 
-    db.session.add(game)
-    db.session.commit()
-    return jsonify({"status": "ok", "message": "Game restarted"})
+        db.session.add(game)
+        db.session.commit()
+        logger.info(
+            "Game id=%s restarted successfully (current_active_index=%s)",
+            game_id,
+            getattr(game, "current_active_index", None),
+        )
+        return jsonify({"status": "ok", "message": "Game restarted"})
+    except Exception as e:
+        # Log stack trace for easier debugging
+        logger.exception("Failed to restart game id=%s: %s", game_id, e)
+        try:
+            db.session.rollback()
+        except Exception:
+            logger.debug("Rollback failed after restart error for game id=%s", game_id)
+        return jsonify({"error": "Failed to restart game"}), 500
 
 
 # Endpoint: end game (mark game finished/inactive)
@@ -892,25 +929,41 @@ def end_game(game_id):
     """
     Mark the game as finished/inactive. When finished, throws are rejected by the server.
     """
-    game = Game.query.get_or_404(game_id)
-    game.finished = True
-    db.session.add(game)
-    db.session.commit()
-
-    # If this game was the recorded last_active_game_id, clear it so frontend won't try to restore a finished game
+    logger.info("End game requested for game id=%s", game_id)
     try:
-        s = Settings.query.first()
-        if s and s.last_active_game_id == game.id:
-            s.last_active_game_id = None
-            db.session.add(s)
-            db.session.commit()
-    except Exception:
+        game = Game.query.get_or_404(game_id)
+        game.finished = True
+        db.session.add(game)
+        db.session.commit()
+        logger.info("Game id=%s marked finished", game_id)
+
+        # If this game was the recorded last_active_game_id, clear it so frontend won't try to restore a finished game
+        try:
+            s = Settings.query.first()
+            if s and s.last_active_game_id == game.id:
+                logger.info(
+                    "Clearing last_active_game_id (was %s) due to game end for game id=%s",
+                    s.last_active_game_id,
+                    game_id,
+                )
+                s.last_active_game_id = None
+                db.session.add(s)
+                db.session.commit()
+        except Exception as inner_e:
+            logger.exception("Failed to clear last_active_game_id after ending game id=%s: %s", game_id, inner_e)
+            try:
+                db.session.rollback()
+            except Exception:
+                logger.debug("Rollback failed after clearing last_active_game_id for game id=%s", game_id)
+
+        return jsonify({"status": "ok", "message": "Game ended"})
+    except Exception as e:
+        logger.exception("Failed to end game id=%s: %s", game_id, e)
         try:
             db.session.rollback()
         except Exception:
-            pass
-
-    return jsonify({"status": "ok", "message": "Game ended"})
+            logger.debug("Rollback failed after end_game error for game id=%s", game_id)
+        return jsonify({"error": "Failed to end game"}), 500
 
 
 # Game state (includes per-player last visit hits and stats, legs/sets state and match history)
