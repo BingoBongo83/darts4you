@@ -698,6 +698,13 @@
       let currentIdx = 0;
       instr.textContent = `Player to click: ${order[currentIdx] ? order[currentIdx].name : '-'}`;
       backdrop.style.display = 'flex';
+      // Activate visual overlay/markers in the board and zoom for precision.
+      if (typeof window.bullsDeciderStartVisual === 'function') {
+        try { window.bullsDeciderStartVisual(order); } catch (e) { console.warn('bullsDeciderStartVisual failed', e); }
+      } else if (typeof window.zoomToBull === 'function') {
+        // Fallback: simple zoom if visual helper not present
+        try { window.zoomToBull(3); } catch(e) { console.warn('zoomToBull failed', e); }
+      }
 
       // Save previous click handler and override for decider
       const prevHandler = window.onDartHit;
@@ -710,9 +717,25 @@
         const dy = segment.y - 0.5;
         const dist2 = dx * dx + dy * dy;
         results[currentIdx] = { x: segment.x, y: segment.y, dist2: dist2, player_id: order[currentIdx].id };
+
+        // update UI row for this player
         const statusEl = document.getElementById(`bulls-status-${currentIdx}`);
         if (statusEl) statusEl.textContent = 'clicked';
+
+        // Add a visual marker on the board for this click (distinct style)
+        try {
+          if (typeof window.bullsDeciderAddMarker === 'function') {
+            window.bullsDeciderAddMarker(segment.x, segment.y, order[currentIdx].id);
+          }
+        } catch (e) { console.warn('bullsDeciderAddMarker failed', e); }
+
+        // advance to next player
         currentIdx += 1;
+        // update visual overlay current player index
+        try {
+          if (typeof window.bullsDeciderSetCurrent === 'function') window.bullsDeciderSetCurrent(currentIdx);
+        } catch(e) { console.warn('bullsDeciderSetCurrent failed', e); }
+
         if (currentIdx < order.length) {
           instr.textContent = `Player to click: ${order[currentIdx].name}`;
         } else {
@@ -744,6 +767,13 @@
               // set currentTurn to chosen index and highlight
               currentTurn = bestIdx;
               highlightActivePlayer();
+
+              // End visual bulls-decider UI and reset zoom
+              try {
+                if (typeof window.bullsDeciderEnd === 'function') window.bullsDeciderEnd();
+                else if (typeof window.resetZoom === 'function') window.resetZoom();
+              } catch (e) { console.warn('Failed to end bulls visual', e); }
+
               // restore handler and hide modal
               window.onDartHit = prevHandler;
               backdrop.style.display = 'none';
@@ -757,9 +787,17 @@
       };
 
       cancelBtn.onclick = () => {
-        // restore handler and hide
+        // cancel visual overlay and restore handler/hide modal
+        try {
+          if (typeof window.bullsDeciderCancel === 'function') window.bullsDeciderCancel();
+          else if (typeof window.bullsDeciderEnd === 'function') window.bullsDeciderEnd();
+          else if (typeof window.resetZoom === 'function') window.resetZoom();
+        } catch (e) { console.warn('Failed to cancel bulls visual', e); }
+
         window.onDartHit = prevHandler;
         backdrop.style.display = 'none';
+
+        // Also let server-side code know if necessary (template-level cancel hook can POST if desired).
       };
     }
 
