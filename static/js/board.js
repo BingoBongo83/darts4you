@@ -1,16 +1,31 @@
-// Simple dartboard canvas mapping with animated zoom-to-bull, transform-aware click handling,
-// and UI overlay for the Bulls decider. Emits global `onDartHit` when user clicks.
-// Sector order clockwise starting at top (20) is:
+/*
+darts4you/static/js/board.js
+
+Dartboard canvas with:
+ - animated zoom-to-bull centered transform
+ - transform-aware click mapping (so normalized coords are correct under zoom)
+ - bulls-decider canvas overlay with Zoom / Cancel controls
+ - animated markers for darts and bulls-decider clicks
+ - optional click sound (uses WebAudio when available)
+ - compatibility helper: only defines window.resizeBoard if not provided by template
+
+This file is self-contained and intended to be loaded before or after the page-level JS.
+If the page supplies its own `resizeBoard` function, that will be used; otherwise this file
+defines a fallback `window.resizeBoard` so the board sizes/initializes correctly.
+*/
+
+// Sector order clockwise starting at top (20)
 const SECTOR_ORDER = [
   20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5,
 ];
 
 const canvas = document.getElementById("board");
-const ctx = canvas.getContext("2d");
-let W = canvas.width,
-  H = canvas.height;
-let cx = W / 2,
-  cy = H / 2;
+const ctx = canvas && canvas.getContext ? canvas.getContext("2d") : null;
+
+let W = (canvas && canvas.width) || 640;
+let H = (canvas && canvas.height) || 640;
+let cx = W / 2;
+let cy = H / 2;
 
 // geometric sizes (computed based on canvas size)
 let outerRadius = (Math.min(W, H) / 2) * 0.78;
@@ -20,34 +35,67 @@ let doubleInner = outerRadius * 0.88;
 let doubleOuter = outerRadius;
 let bullOuter = outerRadius * 0.06;
 let bullInner = outerRadius * 0.03;
-// bigger outer miss ring
 let OUTER_MISS_RING = outerRadius * 1.35;
 
-let markerLayer = []; // official hit markers
-let bullsMarkers = []; // markers from bulls-decider clicks (kept separate)
+// Marker layers
+let markerLayer = []; // official play markers (animated objects)
+let bullsMarkers = []; // bulls-decider markers (animated objects)
 
-/* Zoom state: centerX/centerY are normalized (0..1), scale >= 1 */
+// Zoom / view state
 const zoomState = {
   scale: 1,
-  targetScale: 1,
   centerX: 0.5,
   centerY: 0.5,
   animStart: null,
-  animDuration: 300, // ms
+  animDuration: 300,
   animFromScale: 1,
   animFromCX: 0.5,
   animFromCY: 0.5,
+  targetScale: 1,
+  targetCX: 0.5,
+  targetCY: 0.5,
 };
 
-/* Bulls-decider overlay state */
+// Bulls-decider overlay state
 let bullsDeciderActive = false;
-let bullsDeciderOrder = []; // array of {id,name}
-let bullsDeciderCurrent = 0; // index
-let bullsDeciderResults = []; // {x,y,dist2,player_id}
-let bullsDeciderOverlayVisible = false;
-let bullsDeciderZoomPaused = false; // when true, overlay remains but board is temporarily unzoomed
+let bullsDeciderOrder = []; // [{id,name},...]
+let bullsDeciderCurrent = 0;
+let bullsDeciderZoomed = false; // currently zoomed due to decider
+let bullsDeciderOverlayVisible = null; // overlay hit bounds when drawn
 
-/* Compute geometric sizes based on current canvas size */
+// Audio (lazy)
+let _audioCtx = null;
+function ensureAudioContext() {
+  if (_audioCtx) return;
+  try {
+    _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  } catch (e) {
+    _audioCtx = null;
+  }
+}
+function playClickSoundSimple(freq = 880, dur = 0.12) {
+  // best-effort, fails silently if AudioContext not available or blocked
+  try {
+    ensureAudioContext();
+    if (!_audioCtx) return;
+    const now = _audioCtx.currentTime;
+    const o = _audioCtx.createOscillator();
+    const g = _audioCtx.createGain();
+    o.type = "sine";
+    o.frequency.setValueAtTime(freq, now);
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.exponentialRampToValueAtTime(0.12, now + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    o.connect(g);
+    g.connect(_audioCtx.destination);
+    o.start(now);
+    o.stop(now + dur + 0.02);
+  } catch (e) {
+    // ignore
+  }
+}
+
+/* Compute geometric sizes based on canvas size */
 function computeSizes() {
   W = canvas.width;
   H = canvas.height;
@@ -63,40 +111,42 @@ function computeSizes() {
   OUTER_MISS_RING = outerRadius * 1.35;
 }
 
-/* Apply current zoom transform to ctx.
-   We animate scale/center over time. */
+/* Rounded rectangle helper */
+function roundedRect(ctxLocal, x, y, width, height, radius) {
+  ctxLocal.beginPath();
+  ctxLocal.moveTo(x + radius, y);
+  ctxLocal.arcTo(x + width, y, x + width, y + height, radius);
+  ctxLocal.arcTo(x + width, y + height, x, y + height, radius);
+  ctxLocal.arcTo(x, y + height, x, y, radius);
+  ctxLocal.arcTo(x, y, x + width, y, radius);
+  ctxLocal.closePath();
+}
+
+/* Apply current zoom transform to ctx. */
 function applyZoomTransform() {
-  // compute current animated state
-  const s = zoomState.scale;
+  if (!ctx) return;
+  if (!zoomState || zoomState.scale === 1) return;
   const zx = zoomState.centerX * canvas.width;
   const zy = zoomState.centerY * canvas.height;
   ctx.translate(zx, zy);
-  ctx.scale(s, s);
+  ctx.scale(zoomState.scale, zoomState.scale);
   ctx.translate(-zx, -zy);
 }
 
-/* Start an animated zoom to centerX/centerY (normalized) and targetScale over duration ms.
-   If duration is 0, jump immediately. */
+/* Animate zoom state to target center/scale */
 function animateZoomTo(centerX, centerY, targetScale, duration = 300) {
-  // clamp inputs
   centerX = Math.max(0, Math.min(1, centerX));
   centerY = Math.max(0, Math.min(1, centerY));
   targetScale = Math.max(1, targetScale || 1);
-  duration = Math.max(0, duration);
+  duration = Math.max(0, duration || 0);
 
-  // cancel any existing animation by capturing current computed values
-  // if an animation is ongoing, compute intermediate value
   const now = performance.now();
-  let currentScale = zoomState.scale;
-  let currentCX = zoomState.centerX;
-  let currentCY = zoomState.centerY;
-
-  // init animation state
+  // capture start values
   zoomState.animStart = now;
   zoomState.animDuration = duration;
-  zoomState.animFromScale = currentScale;
-  zoomState.animFromCX = currentCX;
-  zoomState.animFromCY = currentCY;
+  zoomState.animFromScale = zoomState.scale;
+  zoomState.animFromCX = zoomState.centerX;
+  zoomState.animFromCY = zoomState.centerY;
   zoomState.targetScale = targetScale;
   zoomState.targetCX = centerX;
   zoomState.targetCY = centerY;
@@ -114,8 +164,7 @@ function animateZoomTo(centerX, centerY, targetScale, duration = 300) {
     const start = zoomState.animStart;
     const dur = zoomState.animDuration;
     const t = Math.min(1, (ts - start) / dur);
-    // ease (cubic out)
-    const ease = 1 - Math.pow(1 - t, 3);
+    const ease = 1 - Math.pow(1 - t, 3); // cubic ease out
     zoomState.scale =
       zoomState.animFromScale +
       (zoomState.targetScale - zoomState.animFromScale) * ease;
@@ -124,55 +173,57 @@ function animateZoomTo(centerX, centerY, targetScale, duration = 300) {
     zoomState.centerY =
       zoomState.animFromCY + (zoomState.targetCY - zoomState.animFromCY) * ease;
     redrawAll();
-    if (t < 1) {
-      requestAnimationFrame(step);
-    } else {
-      zoomState.animStart = null;
-    }
+    if (t < 1) requestAnimationFrame(step);
+    else zoomState.animStart = null;
   }
   requestAnimationFrame(step);
 }
 
 /* Draw the dartboard */
 function drawBoard() {
+  if (!ctx) return;
   computeSizes();
   ctx.save();
   ctx.clearRect(0, 0, W, H);
 
-  // Fill background first (no zoom)
+  // Background
   ctx.fillStyle = "#071826";
   ctx.fillRect(0, 0, W, H);
 
-  // Apply zoom for board drawing and markers so everything scales consistently
+  // Apply zoom transform for board drawing & markers
   applyZoomTransform();
 
-  const slice = (Math.PI * 2) / 20; // wedge angle
+  const slice = (Math.PI * 2) / 20;
   for (let i = 0; i < 20; i++) {
     const start = i * slice - Math.PI / 2 - slice / 2;
     const end = start + slice;
-    // base single areas
+
+    // base singles area
     ctx.beginPath();
     ctx.moveTo(cx, cy);
     ctx.arc(cx, cy, doubleOuter, start, end);
     ctx.closePath();
-    ctx.fillStyle = i % 2 == 0 ? "#0b1220" : "#f5f1dc";
+    ctx.fillStyle = i % 2 === 0 ? "#0b1220" : "#f5f1dc";
     ctx.fill();
+
     // triple ring
     ctx.beginPath();
     ctx.moveTo(cx, cy);
     ctx.arc(cx, cy, tripleOuter, start, end);
     ctx.arc(cx, cy, tripleInner, end, start, true);
     ctx.closePath();
-    ctx.fillStyle = i % 2 == 0 ? "#c00" : "#006400";
+    ctx.fillStyle = i % 2 === 0 ? "#c00" : "#006400";
     ctx.fill();
+
     // double ring
     ctx.beginPath();
     ctx.moveTo(cx, cy);
     ctx.arc(cx, cy, doubleOuter, start, end);
     ctx.arc(cx, cy, doubleInner, end, start, true);
     ctx.closePath();
-    ctx.fillStyle = i % 2 == 0 ? "#c00" : "#006400";
+    ctx.fillStyle = i % 2 === 0 ? "#c00" : "#006400";
     ctx.fill();
+
     // number ring
     const mid = (start + end) / 2;
     const numRadius = outerRadius + Math.max(14, W * 0.028);
@@ -189,7 +240,6 @@ function drawBoard() {
     const rx = tx - rectW / 2;
     const ry = ty - rectH / 2;
     const rRadius = Math.min(8, rectH / 2);
-    ctx.beginPath();
     roundedRect(ctx, rx, ry, rectW, rectH, rRadius);
     ctx.fillStyle = "rgba(0,0,0,0.6)";
     ctx.fill();
@@ -204,6 +254,7 @@ function drawBoard() {
     ctx.fillText(text, tx, ty);
     ctx.shadowBlur = 0;
   }
+
   // bull
   ctx.beginPath();
   ctx.arc(cx, cy, bullOuter, 0, Math.PI * 2);
@@ -214,48 +265,37 @@ function drawBoard() {
   ctx.fillStyle = "#c00";
   ctx.fill();
 
-  // outer miss ring
+  // outer miss rings
   ctx.beginPath();
   ctx.arc(cx, cy, OUTER_MISS_RING, 0, Math.PI * 2);
   ctx.strokeStyle = "rgba(255,255,255,0.06)";
   ctx.lineWidth = Math.max(3, Math.floor(W / 160));
   ctx.stroke();
+
   ctx.beginPath();
   ctx.arc(cx, cy, OUTER_MISS_RING, 0, Math.PI * 2);
   ctx.strokeStyle = "rgba(255,255,50,0.025)";
   ctx.lineWidth = Math.max(12, Math.floor(W / 60));
   ctx.stroke();
 
-  // Draw official markers and bulls-decider markers while under zoom transform
+  // markers (drawn under zoom transform)
   drawMarkersLayer();
 
-  ctx.restore(); // restore to non-transformed state for overlay UI
-  // draw Bulls-decider overlay (non-transformed)
+  ctx.restore(); // back to screen coordinates
+
+  // overlay (zoom hint + bulls decider info) drawn in screen coords
   drawBullsOverlay();
 }
 
-/* helper to draw rounded rectangle */
-function roundedRect(ctxParam, x, y, width, height, radius) {
-  ctxParam.moveTo(x + radius, y);
-  ctxParam.arcTo(x + width, y, x + width, y + height, radius);
-  ctxParam.arcTo(x + width, y + height, x, y + height, radius);
-  ctxParam.arcTo(x, y + height, x, y, radius);
-  ctxParam.arcTo(x, y, x + width, y, radius);
-  ctxParam.closePath();
-}
-
-/* Given a hit, compute pixel coordinates. If x_norm/y_norm provided, use that (exact clicked position).
-   Returned coordinates are in canvas pixel space BEFORE applying zoom transforms. The drawing functions
-   apply the zoom transform themselves so markers line up with board drawing.
-*/
+/* Map stored hit data (value/multiplier or normalized coords) to pixel coords in logical canvas coordinates */
 function hitToCoord(hit) {
   computeSizes();
-  // server stored normalized coords: convert to pixels (unzoomed logical)
+  // If stored normalized coords (0..1)
   if (typeof hit.x === "number" && typeof hit.y === "number") {
     if (hit.x <= 1 && hit.y <= 1) {
       return { x: hit.x * canvas.width, y: hit.y * canvas.height };
     }
-    // fallback: assume pixel coords already
+    // fallback: assume already pixel coords
     return { x: hit.x, y: hit.y };
   }
 
@@ -267,61 +307,93 @@ function hitToCoord(hit) {
   const start = idx * slice - Math.PI / 2 - slice / 2;
   const mid = start + slice / 2;
   let r;
-  if (hit.multiplier === 3) {
-    r = (tripleInner + tripleOuter) / 2;
-  } else if (hit.multiplier === 2) {
-    r = (doubleInner + doubleOuter) / 2;
-  } else if (hit.multiplier === 1) {
+  if (hit.multiplier === 3) r = (tripleInner + tripleOuter) / 2;
+  else if (hit.multiplier === 2) r = (doubleInner + doubleOuter) / 2;
+  else if (hit.multiplier === 1)
     r = (tripleOuter + doubleInner) / 2 - outerRadius * 0.03;
-  } else {
-    r = OUTER_MISS_RING;
-  }
+  else r = OUTER_MISS_RING;
   const x = cx + Math.cos(mid) * r;
   const y = cy + Math.sin(mid) * r;
   return { x, y };
 }
 
-/* Draw markers (array of hits) */
+/* Draw markers: both official game markers and bulls-decider markers.
+   Markers support a short pulse animation when created; animation driven by presence of animStart/animDur on marker objects.
+*/
 function drawMarkersLayer() {
-  // official markers
-  markerLayer.forEach((m) => {
+  if (!ctx) return;
+  const now = performance.now();
+
+  // Official markers (played darts)
+  for (let i = 0; i < markerLayer.length; i++) {
+    const m = markerLayer[i];
     const coord = hitToCoord(m);
-    const radius = Math.max(6, Math.floor(canvas.width / 80));
+    const baseRadius = Math.max(6, Math.floor(canvas.width / 80));
+    const t = m.animStart
+      ? Math.min(1, (now - m.animStart) / (m.animDur || 380))
+      : 1;
+    const ease = 1 - Math.pow(1 - t, 2);
+    const radius = baseRadius * (1 + 0.6 * (1 - ease));
     ctx.beginPath();
     ctx.arc(coord.x, coord.y, radius, 0, Math.PI * 2);
     ctx.fillStyle = m.color || "rgba(255,255,50,0.95)";
     ctx.save();
     ctx.shadowColor = m.color || "rgba(255,255,50,0.95)";
-    ctx.shadowBlur = 12;
+    ctx.shadowBlur = Math.floor(12 * (1 - ease) + 2);
+    ctx.globalAlpha = 0.9 + 0.1 * (1 - ease);
     ctx.fill();
     ctx.restore();
     ctx.beginPath();
-    ctx.arc(coord.x, coord.y, radius, 0, Math.PI * 2);
+    ctx.arc(coord.x, coord.y, Math.max(2, Math.floor(radius)), 0, Math.PI * 2);
     ctx.strokeStyle = "rgba(0,0,0,0.6)";
     ctx.lineWidth = 1;
     ctx.stroke();
-  });
+    // Remove animation metadata once finished to free fields
+    if (m.animStart && t >= 1) {
+      delete m.animStart;
+      delete m.animDur;
+    }
+  }
 
-  // bulls-decider markers (distinct style)
-  bullsMarkers.forEach((m) => {
+  // Bulls-decider markers (distinct color)
+  for (let j = 0; j < bullsMarkers.length; j++) {
+    const m = bullsMarkers[j];
     const coord = hitToCoord(m);
-    const radius = Math.max(5, Math.floor(canvas.width / 110));
+    const baseRadius = Math.max(5, Math.floor(canvas.width / 110));
+    const t = m.animStart
+      ? Math.min(1, (now - m.animStart) / (m.animDur || 420))
+      : 1;
+    const ease = 1 - Math.pow(1 - t, 2);
+    const radius = baseRadius * (1 + 0.8 * (1 - ease));
     ctx.beginPath();
     ctx.arc(coord.x, coord.y, radius, 0, Math.PI * 2);
     ctx.fillStyle = m.color || "rgba(32,201,151,0.95)";
+    ctx.save();
+    ctx.shadowColor = "rgba(32,201,151,0.95)";
+    ctx.shadowBlur = Math.floor(18 * (1 - ease) + 2);
+    ctx.globalAlpha = 0.95;
     ctx.fill();
+    ctx.restore();
     ctx.beginPath();
-    ctx.arc(coord.x, coord.y, radius, 0, Math.PI * 2);
+    ctx.arc(coord.x, coord.y, Math.max(2, Math.floor(radius)), 0, Math.PI * 2);
     ctx.strokeStyle = "rgba(0,0,0,0.6)";
     ctx.lineWidth = 1;
     ctx.stroke();
-  });
+    if (m.animStart && t >= 1) {
+      delete m.animStart;
+      delete m.animDur;
+    }
+  }
 }
 
-/* Bulls-decider overlay drawing (non-transformed) */
+/* Draw bulls-decider overlay in screen coordinates (non-transformed) */
 function drawBullsOverlay() {
-  // Only draw overlay when decider is active or zoomed
-  if (!bullsDeciderActive && zoomState.scale === 1) return;
+  if (!ctx) return;
+  // show overlay if decider is active OR if zoom is active (so user sees hint)
+  if (!bullsDeciderActive && zoomState.scale === 1) {
+    bullsDeciderOverlayVisible = null;
+    return;
+  }
 
   const padding = 10;
   const boxW = 260;
@@ -329,7 +401,6 @@ function drawBullsOverlay() {
   const x = canvas.width - boxW - 12;
   const y = 12;
 
-  // background
   ctx.save();
   ctx.globalAlpha = 0.95;
   ctx.fillStyle = "rgba(6,20,27,0.92)";
@@ -339,25 +410,25 @@ function drawBullsOverlay() {
   ctx.lineWidth = 1;
   ctx.stroke();
 
-  // text
   ctx.fillStyle = "#e6eef6";
   ctx.font = "14px sans-serif";
   ctx.textAlign = "left";
   ctx.textBaseline = "top";
+
   const title = bullsDeciderActive
-    ? bullsDeciderZoomPaused
-      ? "Bulls decider (paused zoom)"
-      : "Bulls decider active"
+    ? bullsDeciderZoomed
+      ? "Bulls decider active"
+      : "Bulls decider (paused zoom)"
     : "Zoomed";
   ctx.fillText(title, x + padding, y + 8);
 
-  // current player hint (always visible while decider active even if zoom paused)
   if (bullsDeciderActive && bullsDeciderOrder && bullsDeciderOrder.length) {
-    const cur =
-      bullsDeciderOrder[
-        Math.max(0, Math.min(bullsDeciderOrder.length - 1, bullsDeciderCurrent))
-      ];
-    const name = cur ? cur.name : "-";
+    const idx = Math.max(
+      0,
+      Math.min(bullsDeciderOrder.length - 1, bullsDeciderCurrent),
+    );
+    const cur = bullsDeciderOrder[idx] || {};
+    const name = cur.name || "-";
     ctx.fillStyle = "rgba(226,238,246,0.95)";
     ctx.font = "12px sans-serif";
     ctx.fillText(`Player to click: ${name}`, x + padding, y + 34);
@@ -367,7 +438,7 @@ function drawBullsOverlay() {
     ctx.fillText("Click board to set bulls", x + padding, y + 34);
   }
 
-  // small buttons: [Zoom/Rezoom] [Cancel]
+  // Buttons (Zoom / Cancel)
   const btnH = 30;
   const btnW = 82;
   const gap = 8;
@@ -375,7 +446,7 @@ function drawBullsOverlay() {
   const btnCancelX = x + boxW - padding - btnW;
   const btnY = y + boxH - padding - btnH;
 
-  // Zoom / Re-zoom button
+  // Zoom button
   ctx.fillStyle = "rgba(32,201,151,0.12)";
   roundedRect(ctx, btnZoomX, btnY, btnW, btnH, 6);
   ctx.fill();
@@ -383,7 +454,7 @@ function drawBullsOverlay() {
   ctx.font = "12px sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  const zoomLabel = bullsDeciderZoomPaused ? "Re-zoom" : "Zoom";
+  const zoomLabel = bullsDeciderZoomed ? "Zoom" : "Re-zoom";
   ctx.fillText(zoomLabel, btnZoomX + btnW / 2, btnY + btnH / 2);
 
   // Cancel button
@@ -406,25 +477,30 @@ function drawBullsOverlay() {
   ctx.restore();
 }
 
-/* clear and redraw board + markers */
+/* Redraw convenience */
 function redrawAll() {
   drawBoard();
 }
 
-window.redrawBoard = redrawAll;
-
-/* Show markers for hits; hits can include x,y normalized (0..1) or not */
+/* Exposed API: showMarkers / clearMarkers */
 window.showMarkers = function (hits, color = "rgba(255,255,50,0.95)") {
+  const now = performance.now();
   markerLayer = (hits || []).map((h) => {
     const copy = {
       value: h.value,
       multiplier: h.multiplier,
       label: h.label,
       color,
+      x: h.x,
+      y: h.y,
+      animStart: now,
+      animDur: 380,
     };
-    if (h.x !== undefined && h.x !== null) ((copy.x = h.x), (copy.y = h.y));
     return copy;
   });
+  try {
+    playClickSoundSimple(880, 0.12);
+  } catch (e) {}
   redrawAll();
 };
 
@@ -433,14 +509,7 @@ window.clearMarkers = function () {
   redrawAll();
 };
 
-// initial draw
-drawBoard();
-
-/* Zoom API (animated)
-   - zoomTo(centerX, centerY, scale, duration)
-   - zoomToBull(scale, duration)
-   - resetZoom(duration)
-*/
+/* Zoom API */
 function setZoomAnimated(centerX, centerY, targetScale, duration = 300) {
   animateZoomTo(centerX, centerY, targetScale, duration);
 }
@@ -449,27 +518,22 @@ window.zoomTo = function (centerX, centerY, scale, duration) {
 };
 window.zoomToBull = function (scale = 3, duration = 300) {
   const clamped = Math.max(1, Math.min(6, scale));
-  // allow repeated calls while bulls decider active
   setZoomAnimated(0.5, 0.5, clamped, duration);
 };
-window.resetZoom = function (duration = 200) {
+window.resetZoom = function (duration = 300) {
   setZoomAnimated(0.5, 0.5, 1, duration);
 };
 
-/* Bulls-decider helpers for overlay and markers */
+/* Bulls-decider visual helpers */
 window.bullsDeciderStartVisual = function (order) {
   bullsDeciderActive = true;
-  bullsDeciderZoomPaused = false;
+  bullsDeciderZoomed = true;
   bullsDeciderOrder = (order || []).map((o) => ({ id: o.id, name: o.name }));
   bullsDeciderCurrent = 0;
-  bullsDeciderResults = new Array(bullsDeciderOrder.length).fill(null);
   bullsMarkers = [];
-  // ensure zoomed for precision
   try {
     window.zoomToBull(3, 350);
-  } catch (e) {
-    /* ignore if missing */
-  }
+  } catch (e) {}
   redrawAll();
 };
 window.bullsDeciderSetCurrent = function (idx) {
@@ -477,211 +541,265 @@ window.bullsDeciderSetCurrent = function (idx) {
   redrawAll();
 };
 window.bullsDeciderAddMarker = function (x_norm, y_norm, player_id) {
-  // add to bullsMarkers so it's drawn distinct
-  bullsMarkers.push({
+  const now = performance.now();
+  const marker = {
     x: x_norm,
     y: y_norm,
     color: "rgba(32,201,151,0.95)",
     value: 0,
     multiplier: 0,
-  });
+    animStart: now,
+    animDur: 420,
+  };
+  bullsMarkers.push(marker);
+  try {
+    playClickSoundSimple(720, 0.12);
+  } catch (e) {}
   redrawAll();
 };
-window.bullsDeciderTogglePauseZoom = function () {
-  // Toggle temporary unzoom while keeping the decider active and overlay visible
+window.bullsDeciderEnd = function () {
+  bullsDeciderActive = false;
+  bullsDeciderOrder = [];
+  bullsDeciderCurrent = 0;
+  bullsMarkers = [];
+  bullsDeciderZoomed = false;
+  try {
+    window.resetZoom(250);
+  } catch (e) {}
+  redrawAll();
+};
+window.bullsDeciderTempUnzoom = function () {
   if (!bullsDeciderActive) return;
-  bullsDeciderZoomPaused = !bullsDeciderZoomPaused;
-  if (bullsDeciderZoomPaused) {
-    // temporarily unzoom to allow board to be seen full
+  bullsDeciderZoomed = false;
+  try {
+    window.resetZoom(200);
+  } catch (e) {}
+  redrawAll();
+};
+window.bullsDeciderRezoom = function (scale = 3, duration = 300) {
+  if (!bullsDeciderActive) return;
+  bullsDeciderZoomed = true;
+  try {
+    window.zoomToBull(scale, duration);
+  } catch (e) {}
+};
+window.bullsDeciderTogglePauseZoom = function () {
+  if (!bullsDeciderActive) return;
+  if (bullsDeciderZoomed) {
+    bullsDeciderZoomed = false;
     try {
-      window.resetZoom(200);
+      window.resetZoom(220);
     } catch (e) {}
   } else {
-    // re-zoom for precise clicks
+    bullsDeciderZoomed = true;
     try {
       window.zoomToBull(3, 300);
     } catch (e) {}
   }
   redrawAll();
 };
-window.bullsDeciderEnd = function () {
-  bullsDeciderActive = false;
-  bullsDeciderZoomPaused = false;
-  bullsDeciderOrder = [];
-  bullsDeciderCurrent = 0;
-  bullsDeciderResults = [];
-  bullsMarkers = [];
-  // reset zoom
-  try {
-    window.resetZoom(250);
-  } catch (e) {}
-  redrawAll();
-};
 window.bullsDeciderCancel = function () {
-  // Full end / cancel of the visual decider (keeps behavior consistent with modal cancel)
+  // Full cancel => end visuals
   window.bullsDeciderEnd();
 };
 
-/* Click handling (transform-aware + overlay detection)
-   When the canvas is zoomed via the internal zoomState, clicks received from the browser are in
-   post-transform (screen) canvas pixel coordinates. We must map them back through the inverse zoom
-   transform to find the logical board coordinates to compute sector/multiplier.
-
-   Additionally, if the user clicks the overlay [Zoom] / [Cancel] buttons, handle those.
+/* Click handling:
+   - If overlay buttons clicked, handle them
+   - Otherwise map screen coords to logical coords using inverse transform and compute sector
 */
-canvas.addEventListener("click", function (e) {
-  const rect = canvas.getBoundingClientRect();
-  const pixelX = e.clientX - rect.left;
-  const pixelY = e.clientY - rect.top;
+if (canvas) {
+  canvas.addEventListener("click", function (e) {
+    const rect = canvas.getBoundingClientRect();
+    const pixelX = e.clientX - rect.left;
+    const pixelY = e.clientY - rect.top;
 
-  // If overlay visible, check for overlay button hits first (overlay is drawn in screen coords)
-  if (bullsDeciderOverlayVisible) {
-    const ov = bullsDeciderOverlayVisible;
-    // Zoom button
-    const bz = ov.btnZoom;
-    if (
-      pixelX >= bz.x &&
-      pixelX <= bz.x + bz.w &&
-      pixelY >= bz.y &&
-      pixelY <= bz.y + bz.h
-    ) {
-      // re-zoom into bull (allow repeated zooms while decider active)
-      if (bullsDeciderActive) window.zoomToBull(3, 300);
-      return;
-    }
-    // Cancel button
-    const bc = ov.btnCancel;
-    if (
-      pixelX >= bc.x &&
-      pixelX <= bc.x + bc.w &&
-      pixelY >= bc.y &&
-      pixelY <= bc.y + bc.h
-    ) {
-      // If decider is active, this acts as a temporary unzoom (pause) so users can inspect board;
-      // re-clicking the Zoom button will re-zoom. If decider is not active, perform full cancel.
-      if (bullsDeciderActive) {
-        if (typeof window.bullsDeciderTogglePauseZoom === "function")
+    // If overlay visible, check buttons first (screen coords)
+    if (bullsDeciderOverlayVisible) {
+      const ov = bullsDeciderOverlayVisible;
+      const bz = ov.btnZoom;
+      if (
+        pixelX >= bz.x &&
+        pixelX <= bz.x + bz.w &&
+        pixelY >= bz.y &&
+        pixelY <= bz.y + bz.h
+      ) {
+        if (bullsDeciderActive) {
+          // toggle pause (temp unzoom / re-zoom)
           window.bullsDeciderTogglePauseZoom();
-      } else {
-        if (typeof window.bullsDeciderCancel === "function")
-          window.bullsDeciderCancel();
+        } else {
+          try {
+            window.zoomToBull(3, 300);
+          } catch (e) {}
+        }
+        return;
       }
-      // Also call server-side cancel if needed - template-level handlers will still run as appropriate.
+      const bc = ov.btnCancel;
+      if (
+        pixelX >= bc.x &&
+        pixelX <= bc.x + bc.w &&
+        pixelY >= bc.y &&
+        pixelY <= bc.y + bc.h
+      ) {
+        if (bullsDeciderActive) {
+          // temporary unzoom (pause) rather than full cancellation
+          window.bullsDeciderTempUnzoom();
+        } else {
+          window.bullsDeciderCancel();
+        }
+        return;
+      }
+    }
+
+    // Map screen pixel coords back to logical (inverse of transform)
+    let logicalX = pixelX;
+    let logicalY = pixelY;
+    if (zoomState && zoomState.scale && zoomState.scale !== 1) {
+      const zx = zoomState.centerX * canvas.width;
+      const zy = zoomState.centerY * canvas.height;
+      logicalX = zx + (pixelX - zx) / zoomState.scale;
+      logicalY = zy + (pixelY - zy) / zoomState.scale;
+    }
+
+    const dx = logicalX - cx;
+    const dy = logicalY - cy;
+    const r = Math.sqrt(dx * dx + dy * dy);
+    const ang = Math.atan2(dy, dx);
+    let normalized = ang + Math.PI / 2;
+    if (normalized < 0) normalized += Math.PI * 2;
+    const slice = (Math.PI * 2) / 20;
+    let adjusted = normalized + slice / 2;
+    if (adjusted >= Math.PI * 2) adjusted -= Math.PI * 2;
+    const sectorIdx = Math.floor((adjusted / (Math.PI * 2)) * 20);
+    let sector = SECTOR_ORDER[sectorIdx % 20];
+    let multiplier = 1;
+    let label = `S${sector}`;
+
+    if (r > OUTER_MISS_RING) {
+      // outside active area -> ignore
       return;
     }
-  }
 
-  // Map screen pixel coords back to the unzoomed logical coordinates
-  let logicalX = pixelX;
-  let logicalY = pixelY;
-  if (zoomState.targetScale && zoomState.scale !== 1) {
-    const zx = zoomState.centerX * canvas.width;
-    const zy = zoomState.centerY * canvas.height;
-    // inverse transform: x_logical = zx + (x_screen - zx) / scale
-    logicalX = zx + (pixelX - zx) / zoomState.scale;
-    logicalY = zy + (pixelY - zy) / zoomState.scale;
-  }
+    if (r > outerRadius && r <= OUTER_MISS_RING) {
+      multiplier = 0;
+      label = "OUT";
+      sector = 0;
+    } else if (r <= bullInner) {
+      multiplier = 2;
+      label = "BULL";
+      sector = 25;
+    } else if (r <= bullOuter) {
+      multiplier = 1;
+      label = "SBULL";
+      sector = 25;
+    } else if (r >= tripleInner && r <= tripleOuter) {
+      multiplier = 3;
+      label = `T${sector}`;
+    } else if (r >= doubleInner && r <= doubleOuter) {
+      multiplier = 2;
+      label = `D${sector}`;
+    } else {
+      multiplier = 1;
+      label = `S${sector}`;
+    }
 
-  const dx = logicalX - cx;
-  const dy = logicalY - cy;
-  const r = Math.sqrt(dx * dx + dy * dy);
-  const ang = Math.atan2(dy, dx);
-  let normalized = ang + Math.PI / 2;
-  if (normalized < 0) normalized += Math.PI * 2;
+    const x_norm = logicalX / canvas.width;
+    const y_norm = logicalY / canvas.height;
 
-  const slice = (Math.PI * 2) / 20;
-  let adjusted = normalized + slice / 2;
-  if (adjusted >= Math.PI * 2) adjusted -= Math.PI * 2;
-  const sectorIdx = Math.floor((adjusted / (Math.PI * 2)) * 20);
-  let sector = SECTOR_ORDER[sectorIdx % 20];
-  let multiplier = 1;
-  let label = `S${sector}`;
+    // audio + visual feedback for every dart click
+    try {
+      playClickSoundSimple(750, 0.12);
+    } catch (e) {}
 
-  if (r > OUTER_MISS_RING) {
-    return;
-  }
+    // If decider active, add to bullsMarkers (we also call bullsDeciderAddMarker elsewhere)
+    if (bullsDeciderActive) {
+      const now = performance.now();
+      bullsMarkers.push({
+        x: x_norm,
+        y: y_norm,
+        color: "rgba(32,201,151,0.95)",
+        value: sector,
+        multiplier,
+        animStart: now,
+        animDur: 420,
+      });
+      redrawAll();
+    } else {
+      // official game markers: push animated marker
+      const now = performance.now();
+      markerLayer.push({
+        x: x_norm,
+        y: y_norm,
+        value: sector,
+        multiplier,
+        label,
+        color: "rgba(32,201,151,0.95)",
+        animStart: now,
+        animDur: 420,
+      });
+      if (markerLayer.length > 80) markerLayer.shift();
+      redrawAll();
+    }
 
-  if (r > outerRadius && r <= OUTER_MISS_RING) {
-    multiplier = 0;
-    label = "OUT";
-    sector = 0;
-  } else if (r <= bullInner) {
-    multiplier = 2;
-    label = "BULL";
-    sector = 25;
-  } else if (r <= bullOuter) {
-    multiplier = 1;
-    label = "SBULL";
-    sector = 25;
-  } else if (r >= tripleInner && r <= tripleOuter) {
-    multiplier = 3;
-    label = `T${sector}`;
-  } else if (r >= doubleInner && r <= doubleOuter) {
-    multiplier = 2;
-    label = `D${sector}`;
-  } else {
-    multiplier = 1;
-    label = `S${sector}`;
-  }
-
-  // normalized coordinates (0..1) - logical positions before zoom
-  const x_norm = logicalX / canvas.width;
-  const y_norm = logicalY / canvas.height;
-
-  // If bulls-decider is active, add a visual marker and pass through to app via onDartHit
-  if (bullsDeciderActive) {
-    // store this marker visually
-    bullsMarkers.push({
-      x: x_norm,
-      y: y_norm,
-      color: "rgba(32,201,151,0.95)",
-      value: sector,
-      multiplier,
-    });
-    redrawAll();
-  }
-
-  if (typeof window.onDartHit === "function") {
-    window.onDartHit({
-      value: sector,
-      multiplier: multiplier,
-      label: label,
-      x: x_norm,
-      y: y_norm,
-      px: logicalX,
-      py: logicalY,
-    });
-  }
-});
-
-/* Board sizing & redraw - make sure bottom profiles remain visible */
-function resizeBoard() {
-  const canvasEl = document.getElementById("board");
-  const wrap = canvasEl.parentElement;
-  const size = Math.min(wrap.clientWidth - 36, window.innerHeight - 240);
-  canvasEl.width = size;
-  canvasEl.height = size;
-  if (typeof window.redrawBoard === "function") window.redrawBoard();
-  // re-show markers (they will redraw respecting current zoom)
-  if (markerLayer && markerLayer.length)
-    window.showMarkers(markerLayer, "rgba(255,255,50,0.95)");
-}
-window.addEventListener("resize", resizeBoard);
-
-// Utility escape (used elsewhere in app)
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, function (m) {
-    return {
-      "&": "&amp;",
-      "<": "&lt;",
-      ">": "&gt;",
-      '"': "&quot;",
-      "'": "&#39;",
-    }[m];
+    // call app handler (board integration)
+    if (typeof window.onDartHit === "function") {
+      try {
+        window.onDartHit({
+          value: sector,
+          multiplier,
+          label,
+          x: x_norm,
+          y: y_norm,
+          px: logicalX,
+          py: logicalY,
+        });
+      } catch (e) {
+        // app handler errored; ignore here
+        console.warn("onDartHit handler threw", e);
+      }
+    }
   });
 }
 
-// Expose some internal state for debugging if needed
+/* Provide a safe resizeBoard if the page hasn't defined one.
+   The template normally defines resizeBoard; only create ours if absent.
+*/
+if (typeof window.resizeBoard === "undefined") {
+  window.resizeBoard = function () {
+    const canvasEl = document.getElementById("board");
+    if (!canvasEl) return;
+    const wrap = canvasEl.parentElement || document.body;
+    const size = Math.min(
+      Math.max(160, wrap.clientWidth - 36),
+      Math.max(160, window.innerHeight - 240),
+    );
+    canvasEl.width = size;
+    canvasEl.height = size;
+    if (typeof window.redrawBoard === "function") window.redrawBoard();
+  };
+}
+
+// If page hasn't already called resizeBoard, do an initial sizing on load
+window.addEventListener("load", function () {
+  try {
+    if (typeof window.resizeBoard === "function") window.resizeBoard();
+    else if (canvas) {
+      // fallback sizing
+      const wrap = canvas.parentElement || document.body;
+      const size = Math.min(
+        Math.max(160, wrap.clientWidth - 36),
+        Math.max(160, window.innerHeight - 240),
+      );
+      canvas.width = size;
+      canvas.height = size;
+      redrawAll();
+    }
+  } catch (e) {
+    // ignore init errors
+    console.warn("board init error", e);
+  }
+});
+
+/* Debug helpers */
 window._boardDebug = {
   getZoomState: () => ({
     scale: zoomState.scale,
@@ -689,12 +807,10 @@ window._boardDebug = {
     centerY: zoomState.centerY,
   }),
   setZoomState: (cX, cY, s, dur) => setZoomAnimated(cX, cY, s, dur),
-  getCanvasSize: () => ({ width: canvas.width, height: canvas.height }),
+  getCanvasSize: () => ({
+    width: canvas ? canvas.width : 0,
+    height: canvas ? canvas.height : 0,
+  }),
   startBullsVisual: (order) => window.bullsDeciderStartVisual(order),
   endBullsVisual: () => window.bullsDeciderEnd(),
 };
-
-// Init
-(function init() {
-  resizeBoard();
-})();
