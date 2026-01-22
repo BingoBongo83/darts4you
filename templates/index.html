@@ -45,6 +45,10 @@
       align-items: center;
       justify-content: center;
       z-index: 60;
+      /* Default behaviour: modal backdrops block pointer events. Individual modals
+         can override this (for example the bulls-decider modal below) when we want
+         clicks to pass through to the board. */
+      pointer-events: auto;
     }
     .modal {
       background: linear-gradient(180deg, #071826, #06141b);
@@ -54,12 +58,34 @@
       width: 420px;
       color: #e6eef6;
       box-shadow: 0 12px 48px rgba(0,0,0,0.6);
+      /* re-enable pointer events for the modal itself (so it's interactive even though the backdrop is passthrough) */
+      pointer-events: auto;
+      /* ensure the modal sits above the board and backdrop visually */
+      z-index: 61;
     }
     .modal h3 { margin:0 0 8px 0; }
     .modal .row { display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px dashed rgba(255,255,255,0.02); }
     .modal .row:last-child { border-bottom: none; }
     .profiles-actions { display:flex; gap:8px; align-items:center; margin-left:8px; }
     .profile-name { font-weight:600; color:#e6eef6; }
+
+    /* Bulls-decider specific: keep the backdrop visually present but allow pointer-events
+       to pass through to the board canvas so players can click on the board even while
+       the decider modal is visible. The decider modal box itself remains interactive. */
+    #bullsDeciderBackdrop {
+      pointer-events: none;
+      background: transparent;
+      z-index: 70;
+    }
+    #bullsDeciderBackdrop .modal {
+      /* make the decider modal interactive while allowing clicks to pass through the rest of the backdrop */
+      pointer-events: auto;
+      position: fixed;
+      right: 16px;
+      top: 16px;
+      width: 360px;
+      z-index: 71;
+    }
   </style>
 </head>
 <body>
@@ -68,25 +94,26 @@
       <h1>Darts Scorer</h1>
 
       <div class="controls-row" style="align-items:center; gap:12px;">
-        <label>Mode:
-          <select id="mode">
-            <option value="501">501</option>
-            <option value="301">301</option>
-            <option value="cricket">Cricket</option>
-            <option value="around">Around the Clock</option>
-          </select>
-        </label>
+          <label>Mode:
+            <select id="mode">
+              <option value="501">501</option>
+              <option value="301">301</option>
+              <option value="cricket">Cricket</option>
+              <option value="around">Around the Clock</option>
+            </select>
+          </label>
 
-        <button id="startGameBtn" class="btn">Start Game</button>
-        <button id="endGameBtn" class="btn secondary" disabled>End Game</button>
+          <button id="startGameBtn" class="btn">Start Game</button>
+          <button id="restartGameBtn" class="btn secondary" disabled>Restart Game</button>
+          <button id="endGameBtn" class="btn secondary" disabled>End Game</button>
 
-        <div style="flex:1"></div>
+          <div style="flex:1"></div>
 
-        <div style="display:flex; gap:8px; align-items:center;">
-          <input id="newProfileName" placeholder="Add player name" style="padding:6px; border-radius:6px; background:var(--card); color:var(--muted); border:1px solid rgba(255,255,255,0.03)"/>
-          <button id="addProfileBtn" class="btn">Add Player</button>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <input id="newProfileName" placeholder="Add player name" style="padding:6px; border-radius:6px; background:var(--card); color:var(--muted); border:1px solid rgba(255,255,255,0.03)"/>
+            <button id="addProfileBtn" class="btn">Add Player</button>
+          </div>
         </div>
-      </div>
 
       <div style="margin-top:8px; color:var(--muted); font-size:13px;">
         Select players by clicking their names below. Click a selected player again to remove them before starting the game.
@@ -144,6 +171,25 @@
             <option value="around">Around the Clock</option>
           </select>
         </div></div>
+
+        <div class="row"><div>Legs to win</div><div>
+          <input id="startLegsInput" type="number" min="1" value="3" style="width:80px;">
+        </div></div>
+
+        <div class="row"><div>Sets to win</div><div>
+          <input id="startSetsInput" type="number" min="1" value="1" style="width:80px;">
+        </div></div>
+
+        <div class="row"><div>Starter selection</div><div>
+          <select id="startFirstMethodSelect">
+            <option value="random">Random</option>
+            <option value="bulls">Bulls decider (each player clicks board once)</option>
+          </select>
+        </div></div>
+
+        <div style="margin-top:6px; color:var(--muted); font-size:13px;">
+          If you choose "Bulls decider", after creating the game each player will be prompted to click the board once; the closest-to-bull click will become the starting player for the first leg.
+        </div>
       </div>
       <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:12px;">
         <button id="startCancelBtn" class="btn secondary">Cancel</button>
@@ -152,10 +198,51 @@
     </div>
   </div>
 
+  <!-- Bulls decider modal: shown when a game is created with first_throw_method == 'bulls' -->
+  <div id="bullsDeciderBackdrop" class="modal-backdrop" style="display:none;">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="bullsDeciderTitle">
+      <h3 id="bullsDeciderTitle">Bulls decider</h3>
+      <div id="bullsDeciderContent">
+        <div style="margin-bottom:8px;">Each player will click the board once. The click closest to the bull (center) goes first.</div>
+        <div id="bullsPlayerList" style="display:flex; flex-direction:column; gap:6px; max-height:200px; overflow:auto;"></div>
+        <div id="bullsInstructions" style="margin-top:8px; color:var(--muted);">Waiting to start...</div>
+      </div>
+      <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:12px;">
+        <button id="bullsCancelBtn" class="btn secondary">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Leg-end / Set-end modal -->
+  <div id="legEndModalBackdrop" class="modal-backdrop" style="display:none;">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="legEndTitle">
+      <h3 id="legEndTitle">Leg summary</h3>
+      <div id="legEndContent">
+        <!-- populated dynamically -->
+      </div>
+      <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:12px;">
+        <button id="legEndCloseBtn" class="btn secondary">Close</button>
+        <button id="legEndNextBtn" class="btn">Next Leg</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Match-winner modal (appears when match is won) -->
+  <div id="matchWinnerBackdrop" class="modal-backdrop" style="display:none;">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="matchWinnerTitle">
+      <h3 id="matchWinnerTitle">Match finished</h3>
+      <div id="matchWinnerContent"></div>
+      <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:12px;">
+        <button id="matchWinnerCloseBtn" class="btn secondary">Close</button>
+      </div>
+    </div>
+  </div>
+
   <script src="/static/js/board.js"></script>
   <script>
     // Application state
     let currentGame = null;
+    let gameFinished = false;
     let players = []; // players in current game (cards left column)
     let profiles = []; // stored profiles from server
     let selectedProfileIds = new Set();
@@ -240,17 +327,19 @@
       profilesListEl.querySelectorAll('[data-add]').forEach(b => b.addEventListener('click', async (ev)=>{
         ev.stopPropagation();
         const id = Number(b.getAttribute('data-add'));
+        // If no active game: toggle selection instead of immediately starting a new game.
+        // This keeps Add-to-game consistent with the selection UX and allows explicit Start Game.
         if (!currentGame) {
-          // Find profile name for modal display
-          const prof = profiles.find(pp => pp.id === id);
-          document.getElementById('startPlayerName').innerText = prof ? prof.name : `#${id}`;
-          pendingProfileToAutoAdd = id;
-          // default modal mode to the main mode selector value
-          const mainMode = document.getElementById('mode') ? document.getElementById('mode').value : '501';
-          document.getElementById('startModeSelect').value = mainMode || '501';
-          document.getElementById('startGameModalBackdrop').style.display = 'flex';
+          if (selectedProfileIds.has(id)) {
+            selectedProfileIds.delete(id);
+          } else {
+            if (selectedProfileIds.size >= 6) { alert('Maximum 6 players allowed'); return; }
+            selectedProfileIds.add(id);
+          }
+          updateSelectedUI();
           return;
         }
+        // Otherwise add the profile to the running game on the server
         try {
           const res = await fetch(`/api/games/${currentGame}/add_player`, {
             method: 'POST',
@@ -352,65 +441,44 @@
 
     // Start/End game handling
     startBtn.addEventListener('click', async () => {
-      if (currentGame) { alert('Game already running'); return; }
+      if (currentGame) { alert('A game is already running. End or Restart it before starting a new one.'); return; }
       if (selectedProfileIds.size === 0) { alert('Select at least one player'); return; }
-      // Build payload: array of profile ids
-      const payloadPlayers = Array.from(selectedProfileIds);
-      const mode = document.getElementById('mode').value;
-      const res = await fetch('/api/new_game', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({mode, players: payloadPlayers})
-      });
-
-      // Some server errors may return non-JSON (HTML error page). Try to parse JSON,
-      // but fall back to plain text so we can show useful error details to the user.
-      let j = null;
-      try {
-        j = await res.json();
-      } catch (parseErr) {
-        // response is not JSON - capture text body for diagnostics
-        try {
-          const txt = await res.text();
-          j = { error: txt };
-        } catch (txtErr) {
-          j = { error: 'Non-JSON error response (and failed to read body)' };
-        }
-      }
-
-      if (!res.ok) {
-        // Prefer structured error fields when available, otherwise show the plain text body
-        const errMsg = (j && (j.error || j.details || j.message)) ? (j.error || j.details || j.message) : 'Failed to start game';
-        // Trim very large HTML responses for the alert but log full details to console
-        const shown = String(errMsg).slice(0, 1000);
-        alert('Failed to start game: ' + shown);
-        console.error('Start game failed', { status: res.status, statusText: res.statusText, body: j });
-        return;
-      }
-
-      currentGame = j.game_id;
-      // lock profile interactions
-      lockProfileInteractions(true);
-      // reset turn state
-      currentTurn = 0;
-      throwsInVisit = 0;
-      currentVisitHits = [];
-      frozenLastVisitMarkers = null;
-      window.clearMarkers();
-      await loadState();
-      startBtn.disabled = true;
-      endBtn.disabled = false;
+      // Open Start Game modal so user can confirm mode/legs/sets/first-method before creating the game
+      pendingProfileToAutoAdd = null; // indicate we're starting with multiple selected players
+      // Show a combined player name list in the modal
+      const names = Array.from(selectedProfileIds).map(id => {
+        const p = profiles.find(pp => pp.id === id);
+        return p ? p.name : `#${id}`;
+      }).join(', ');
+      document.getElementById('startPlayerName').innerText = names || '-';
+      // default modal values
+      document.getElementById('startModeSelect').value = document.getElementById('mode').value || '501';
+      document.getElementById('startLegsInput').value = 3;
+      document.getElementById('startSetsInput').value = 1;
+      document.getElementById('startFirstMethodSelect').value = 'random';
+      document.getElementById('startGameModalBackdrop').style.display = 'flex';
     });
 
     endBtn.addEventListener('click', async () => {
       if (!currentGame) return;
       if (!confirm('End current game?')) return;
-      // simply clear client state; game remains in DB but we allow new game creation
+      // Try to notify server to mark game finished; if endpoint not present, fall back to clearing client state
+      try {
+        const res = await fetch(`/api/games/${currentGame}/end_game`, { method: 'POST' });
+        if (!res.ok) {
+          console.warn('end_game endpoint unavailable or failed; falling back to client-only end.');
+        }
+      } catch (e) {
+        console.warn('Failed to call end_game endpoint; falling back to client-only end.', e);
+      }
+      // clear client state; game remains in DB (or was marked finished by server)
       currentGame = null;
+      gameFinished = false;
       players = [];
       document.getElementById('playersList').innerHTML = '';
       lockProfileInteractions(false);
       startBtn.disabled = false;
+      restartGameBtn.disabled = true;
       endBtn.disabled = true;
       selectedProfileIds.clear();
       updateSelectedUI();
@@ -432,6 +500,8 @@
       const r = await fetch(`/api/game_state/${currentGame}`);
       if (!r.ok) { console.warn('Failed to fetch game state'); return; }
       const data = await r.json();
+      // store finished flag so throws are blocked when game is over
+      gameFinished = Boolean(data && data.game && data.game.finished);
       players = data.players || [];
       renderPlayers(players);
     }
@@ -524,15 +594,33 @@
     });
 
     startConfirmBtn.addEventListener('click', async () => {
-      if (!pendingProfileToAutoAdd) return;
+      // Allow starting either with a single pendingProfileToAutoAdd OR with the selectedProfileIds set.
+      const willStartWithSelection = (pendingProfileToAutoAdd === null);
+      if (!willStartWithSelection && !pendingProfileToAutoAdd) {
+        // nothing to start
+        return;
+      }
       startConfirmBtn.disabled = true;
+
+      // Collect start options from modal
       const selectedMode = startModeSelect.value || (document.getElementById('mode') ? document.getElementById('mode').value : '501');
+      const legsToWin = parseInt(document.getElementById('startLegsInput').value || '3', 10) || 0;
+      const setsToWin = parseInt(document.getElementById('startSetsInput').value || '1', 10) || 0;
+      const firstMethod = document.getElementById('startFirstMethodSelect').value || 'random';
+
       try {
-        // Start a new game with the clicked profile as the sole initial player
+        // Build players payload: either single profile id or array of selected profile ids
+        let playersPayload = [];
+        if (willStartWithSelection) {
+          playersPayload = Array.from(selectedProfileIds);
+        } else {
+          playersPayload = [pendingProfileToAutoAdd];
+        }
+
         const res = await fetch('/api/new_game', {
           method: 'POST',
           headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ mode: selectedMode, players: [pendingProfileToAutoAdd] })
+          body: JSON.stringify({ mode: selectedMode, players: playersPayload, legs_to_win: legsToWin, sets_to_win: setsToWin, first_throw_method: firstMethod })
         });
 
         // Try to parse JSON response safely
@@ -554,11 +642,27 @@
         currentVisitHits = [];
         frozenLastVisitMarkers = null;
         window.clearMarkers();
-        await loadState();
+
+        // mark UI state
         startBtn.disabled = true;
+        restartGameBtn.disabled = false;
         endBtn.disabled = false;
-        // refresh profiles (in case UI needs update)
-        await fetchProfiles();
+
+        // If the chosen starter method is 'bulls', kick off the bulls-decider UI flow
+        if (firstMethod === 'bulls') {
+          // Populate list of players for decider (we will fetch full game state to get names)
+          await loadState();
+          startBullsDecider(currentGame);
+        } else {
+          // Normal start: just load state and enable UI
+          await loadState();
+          await fetchProfiles();
+        }
+
+        // clear selection (we now have an active game)
+        selectedProfileIds.clear();
+        updateSelectedUI();
+
       } catch (err) {
         console.error('Failed to auto-start game', err);
         alert('Network error while starting game');
@@ -568,6 +672,96 @@
         startGameModal.style.display = 'none';
       }
     });
+
+    // Bulls-decider helper: shows modal, asks each player to click once, then posts starter to server
+    function startBullsDecider(gameId) {
+      const backdrop = document.getElementById('bullsDeciderBackdrop');
+      const listEl = document.getElementById('bullsPlayerList');
+      const instr = document.getElementById('bullsInstructions');
+      const cancelBtn = document.getElementById('bullsCancelBtn');
+
+      // Build player list UI
+      listEl.innerHTML = '';
+      const order = (players || []).map(p => ({ id: p.id, name: p.name }));
+      const results = new Array(order.length).fill(null);
+      order.forEach((p, idx) => {
+        const row = document.createElement('div');
+        row.dataset.idx = idx;
+        row.style.display = 'flex';
+        row.style.justifyContent = 'space-between';
+        row.style.padding = '6px 8px';
+        row.style.background = 'rgba(0,0,0,0.04)';
+        row.innerHTML = `<div>${escapeHtml(p.name)}</div><div id="bulls-status-${idx}" style="color:var(--muted)">waiting</div>`;
+        listEl.appendChild(row);
+      });
+
+      let currentIdx = 0;
+      instr.textContent = `Player to click: ${order[currentIdx] ? order[currentIdx].name : '-'}`;
+      backdrop.style.display = 'flex';
+
+      // Save previous click handler and override for decider
+      const prevHandler = window.onDartHit;
+      window.onDartHit = function(segment) {
+        // Only accept clicks with normalized coords (board reports them)
+        if (segment.x === undefined || segment.y === undefined) return;
+
+        // compute squared distance to center (0.5,0.5) using normalized coords
+        const dx = segment.x - 0.5;
+        const dy = segment.y - 0.5;
+        const dist2 = dx * dx + dy * dy;
+        results[currentIdx] = { x: segment.x, y: segment.y, dist2: dist2, player_id: order[currentIdx].id };
+        const statusEl = document.getElementById(`bulls-status-${currentIdx}`);
+        if (statusEl) statusEl.textContent = 'clicked';
+        currentIdx += 1;
+        if (currentIdx < order.length) {
+          instr.textContent = `Player to click: ${order[currentIdx].name}`;
+        } else {
+          instr.textContent = `All clicks recorded. Determining starter...`;
+          // Determine winner (min dist2)
+          let bestIdx = 0;
+          let best = results[0] ? results[0].dist2 : Number.POSITIVE_INFINITY;
+          for (let i = 1; i < results.length; i++) {
+            if (results[i] && results[i].dist2 < best) {
+              best = results[i].dist2;
+              bestIdx = i;
+            }
+          }
+
+          // Post starter to server (if endpoint exists). We send the index relative to game.players order.
+          (async () => {
+            try {
+              const resp = await fetch(`/api/games/${gameId}/set_starter`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ starter_index: bestIdx })
+              });
+              // ignore result - backend may not support and will return 404; still update client state
+            } catch (e) {
+              console.warn('Failed to POST set_starter (server may not implement endpoint)', e);
+            } finally {
+              // update UI: highlight chosen player
+              const chosen = document.querySelector(`#bulls-player-chosen`);
+              // set currentTurn to chosen index and highlight
+              currentTurn = bestIdx;
+              highlightActivePlayer();
+              // restore handler and hide modal
+              window.onDartHit = prevHandler;
+              backdrop.style.display = 'none';
+              startBtn.disabled = true;
+              endBtn.disabled = false;
+              fetchProfiles().catch(()=>{});
+              loadState().catch(()=>{});
+            }
+          })();
+        }
+      };
+
+      cancelBtn.onclick = () => {
+        // restore handler and hide
+        window.onDartHit = prevHandler;
+        backdrop.style.display = 'none';
+      };
+    }
 
     async function showProfileStats(profileId) {
       const res = await fetch(`/api/profiles/${profileId}/stats`);
@@ -591,6 +785,7 @@
     // Board interactions: when a click occurs board.js will call window.onDartHit
     window.onDartHit = async function(segment) {
       if (!currentGame) { alert('Start a game first.'); return; }
+      if (gameFinished) { alert('Game finished. Restart or start a new game to continue.'); return; }
       const curPlayer = players[currentTurn];
       if (!curPlayer) { alert('No players'); return; }
 
@@ -621,10 +816,94 @@
 
       throwsInVisit += 1;
 
-      if (j.status === 'bust' || j.status === 'winner') {
+      // Handle legacy and new statuses
+      if (j.status === 'bust') {
         await advanceToNextPlayer();
         return;
       }
+      if (j.status === 'invalid_finish_needs_double') {
+        // Inform the user; we still advance to next player to keep turn order consistent
+        alert('Invalid finish: must finish on a double (or double bull).');
+        await advanceToNextPlayer();
+        return;
+      }
+
+      // Leg / Set / Match finished cases: show modal requiring user action (Next Leg) or final match popup
+      if (j.status === 'leg_won' || j.status === 'set_won' || j.status === 'match_won') {
+        // Build and show leg/set summary modal
+        try {
+          // Refresh state to get up-to-date players/histories
+          await loadState();
+        } catch (e) {
+          console.warn('Failed to reload state for leg summary', e);
+        }
+
+        const legModal = document.getElementById('legEndModalBackdrop');
+        const legContent = document.getElementById('legEndContent');
+        const closeBtn = document.getElementById('legEndCloseBtn');
+        const nextBtn = document.getElementById('legEndNextBtn');
+
+        // Create a basic summary: winner, message and per-player last_visit / leg counts
+        const winner = j.player_name || (players[currentTurn] && players[currentTurn].name) || 'Unknown';
+        let html = `<div style="margin-bottom:8px;"><strong>${escapeHtml(winner)}</strong> won the leg.</div>`;
+        if (j.status === 'set_won' || j.status === 'match_won') {
+          html += `<div style="margin-bottom:8px; color:var(--muted)">${escapeHtml(j.message || '')}</div>`;
+        }
+
+        html += '<div style="margin-top:6px;">Player summary:</div><div style="display:flex; flex-direction:column; gap:6px; margin-top:6px;">';
+        players.forEach(p => {
+          html += `<div style="display:flex; justify-content:space-between;"><div>${escapeHtml(p.name)}</div><div>Legs: ${p.leg_wins || 0} / Sets: ${p.set_wins || 0}</div></div>`;
+        });
+        html += '</div>';
+        legContent.innerHTML = html;
+
+        legModal.style.display = 'flex';
+
+        // Close simply hides the modal but does not advance the leg (so user can inspect)
+        closeBtn.onclick = () => { legModal.style.display = 'none'; };
+
+        // Next: call /api/games/<id>/next_leg to advance the leg server-side (backend will reset scores/rotate starter)
+        nextBtn.onclick = async () => {
+          nextBtn.disabled = true;
+          try {
+            const r = await fetch(`/api/games/${currentGame}/next_leg`, {
+              method: 'POST',
+              headers: {'Content-Type':'application/json'},
+              body: JSON.stringify({})
+            });
+            if (!r.ok) {
+              const txt = await r.text();
+              alert('Failed to advance to next leg: ' + txt.slice(0, 1000));
+            }
+          } catch (e) {
+            console.error('Failed to call next_leg', e);
+            alert('Network error while advancing to next leg');
+          } finally {
+            nextBtn.disabled = false;
+            legModal.style.display = 'none';
+            // Clear markers and visits and reload state
+            currentVisitHits = [];
+            frozenLastVisitMarkers = null;
+            window.clearMarkers();
+            throwsInVisit = 0;
+            await loadState();
+          }
+        };
+
+        // If match_won, also show the final match modal
+        if (j.status === 'match_won') {
+          const mw = document.getElementById('matchWinnerBackdrop');
+          const mwc = document.getElementById('matchWinnerContent');
+          const mwClose = document.getElementById('matchWinnerCloseBtn');
+          mwc.innerHTML = `<div><strong>${escapeHtml(j.player_name || winner)}</strong> has won the match.</div><div style="margin-top:8px; color:var(--muted)">${escapeHtml(j.message || '')}</div>`;
+          mw.style.display = 'flex';
+          mwClose.onclick = () => { mw.style.display = 'none'; };
+        }
+
+        return;
+      }
+
+      // Normal continuation: if 3 darts thrown advance; otherwise refresh state
       if (throwsInVisit >= 3) {
         await advanceToNextPlayer();
         return;

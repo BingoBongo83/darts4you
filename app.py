@@ -1,9 +1,12 @@
 import os
+import random
+import traceback
 from collections import defaultdict
 from datetime import datetime
 
 from flask import Flask, abort, jsonify, render_template, request
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import text
 
 from checkout import find_checkout
 
@@ -25,7 +28,29 @@ class Game(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     mode = db.Column(db.String(50), default="501")
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    # Match/leg/set configuration and state
+    # Number of legs a player must win to take a set (0 or None means no leg/set counting)
+    legs_to_win = db.Column(db.Integer, nullable=True, default=3)
+    # Number of sets a player must win to take the match (0 or None means no sets)
+    sets_to_win = db.Column(db.Integer, nullable=True, default=1)
+    # Current set and leg counters (1-based)
+    current_set = db.Column(db.Integer, default=1)
+    current_leg = db.Column(db.Integer, default=1)
+
+    # How the first thrower for the first leg is determined: 'random' or 'bulls'
+    first_throw_method = db.Column(db.String(16), default="random")
+
+    # The index (0-based) of the player who will start the current leg within game.players order.
+    # This is persisted so rotation works across reloads.
+    current_start_index = db.Column(db.Integer, default=0)
+
+    # Whether the game/match is finished
+    finished = db.Column(db.Boolean, default=False)
+
     players = db.relationship("Player", backref="game", cascade="all, delete-orphan")
+    # Historical sets recorded for this game (see MatchSet -> Leg)
+    sets = db.relationship("MatchSet", backref="game", cascade="all, delete-orphan")
 
 
 class Player(db.Model):
@@ -36,6 +61,12 @@ class Player(db.Model):
     profile_id = db.Column(db.Integer, db.ForeignKey("profile.id"), nullable=True)
     profile = db.relationship("Profile", backref="game_players")
     game_id = db.Column(db.Integer, db.ForeignKey("game.id"))
+
+    # Per-game counters for legs/sets (ephemeral to this Player instance which is tied to a Game)
+    leg_wins = db.Column(db.Integer, default=0)
+    set_wins = db.Column(db.Integer, default=0)
+
+    # relationship to throws in this game
     throws = db.relationship("Throw", backref="player", cascade="all, delete-orphan")
 
 
@@ -48,6 +79,33 @@ class Throw(db.Model):
     x = db.Column(db.Float, nullable=True)  # normalized x (0..1)
     y = db.Column(db.Float, nullable=True)  # normalized y (0..1)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+# Match history models
+class MatchSet(db.Model):
+    """
+    Represents a set within a Game. Each MatchSet can contain multiple Leg records.
+    """
+
+    id = db.Column(db.Integer, primary_key=True)
+    game_id = db.Column(db.Integer, db.ForeignKey("game.id"))
+    set_number = db.Column(db.Integer, default=1)  # 1-based
+    winner_player_id = db.Column(db.Integer, db.ForeignKey("player.id"), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    legs = db.relationship("Leg", backref="match_set", cascade="all, delete-orphan")
+
+
+class Leg(db.Model):
+    """
+    Represents a single leg inside a MatchSet. Records the winner of the leg and its number.
+    """
+
+    id = db.Column(db.Integer, primary_key=True)
+    match_set_id = db.Column(db.Integer, db.ForeignKey("match_set.id"))
+    leg_number = db.Column(db.Integer, default=1)  # 1-based within the set
+    winner_player_id = db.Column(db.Integer, db.ForeignKey("player.id"), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
 # Ensure tables exist
@@ -91,12 +149,16 @@ with app.app_context():
 
 
 # Helpers
-def ensure_profile_columns():
+def ensure_schema_compatibility():
     """
-    Ensure `profile_id` integer columns exist on `player` and `throw` tables for older SQLite DBs.
-    This is a no-op on non-SQLite databases. We keep this defensive and swallow errors so that
-    startup or request handling doesn't crash because of ALTER TABLE failures — such failures
-    should be investigated and fixed with proper migrations in production.
+    Ensure commonly added columns/tables exist for older SQLite DBs:
+      - player.profile_id, player.leg_wins, player.set_wins
+      - throw.profile_id, throw.x, throw.y
+      - game.* columns added for match/leg support (legs_to_win, sets_to_win, first_throw_method, etc.)
+      - match_set and leg tables will be created by SQLAlchemy's create_all() for new installs.
+
+    This function attempts ALTER TABLE ... ADD COLUMN for missing simple columns on SQLite.
+    It's intentionally defensive and best-effort; use proper migrations for production.
     """
     try:
         try:
@@ -109,19 +171,86 @@ def ensure_profile_columns():
             try:
 
                 def _has_column(table, col):
-                    # Use PRAGMA to inspect columns: returns rows like (cid, name, type, notnull, dflt_value, pk)
-                    res = conn.execute(text(f"PRAGMA table_info('{table}')")).fetchall()
+                    res = conn.execute(f"PRAGMA table_info('{table}')").fetchall()
                     return any(row[1] == col for row in res)
 
-                if not _has_column("player", "profile_id"):
-                    conn.execute(text("ALTER TABLE player ADD COLUMN profile_id INTEGER"))
-                if not _has_column("throw", "profile_id"):
-                    conn.execute(text('ALTER TABLE "throw" ADD COLUMN profile_id INTEGER'))
+                # player columns
+                if _has_column("player", "profile_id") is False:
+                    try:
+                        conn.execute("ALTER TABLE player ADD COLUMN profile_id INTEGER")
+                    except Exception:
+                        pass
+                if _has_column("player", "leg_wins") is False:
+                    try:
+                        conn.execute("ALTER TABLE player ADD COLUMN leg_wins INTEGER DEFAULT 0")
+                    except Exception:
+                        pass
+                if _has_column("player", "set_wins") is False:
+                    try:
+                        conn.execute("ALTER TABLE player ADD COLUMN set_wins INTEGER DEFAULT 0")
+                    except Exception:
+                        pass
+
+                # throw columns
+                if _has_column("throw", "profile_id") is False:
+                    try:
+                        conn.execute('ALTER TABLE "throw" ADD COLUMN profile_id INTEGER')
+                    except Exception:
+                        pass
+                if _has_column("throw", "x") is False:
+                    try:
+                        conn.execute('ALTER TABLE "throw" ADD COLUMN x REAL')
+                    except Exception:
+                        pass
+                if _has_column("throw", "y") is False:
+                    try:
+                        conn.execute('ALTER TABLE "throw" ADD COLUMN y REAL')
+                    except Exception:
+                        pass
+
+                # game columns (added to support newer match/leg/set fields)
+                # These columns are simple and nullable/defaulted so ALTER is safe on SQLite.
+                if _has_column("game", "legs_to_win") is False:
+                    try:
+                        conn.execute("ALTER TABLE game ADD COLUMN legs_to_win INTEGER")
+                    except Exception:
+                        pass
+                if _has_column("game", "sets_to_win") is False:
+                    try:
+                        conn.execute("ALTER TABLE game ADD COLUMN sets_to_win INTEGER")
+                    except Exception:
+                        pass
+                if _has_column("game", "current_set") is False:
+                    try:
+                        conn.execute("ALTER TABLE game ADD COLUMN current_set INTEGER DEFAULT 1")
+                    except Exception:
+                        pass
+                if _has_column("game", "current_leg") is False:
+                    try:
+                        conn.execute("ALTER TABLE game ADD COLUMN current_leg INTEGER DEFAULT 1")
+                    except Exception:
+                        pass
+                if _has_column("game", "first_throw_method") is False:
+                    try:
+                        conn.execute("ALTER TABLE game ADD COLUMN first_throw_method VARCHAR(32) DEFAULT 'random'")
+                    except Exception:
+                        pass
+                if _has_column("game", "current_start_index") is False:
+                    try:
+                        conn.execute("ALTER TABLE game ADD COLUMN current_start_index INTEGER DEFAULT 0")
+                    except Exception:
+                        pass
+                if _has_column("game", "finished") is False:
+                    try:
+                        # SQLite does not have native BOOLEAN type - use INTEGER default 0
+                        conn.execute("ALTER TABLE game ADD COLUMN finished INTEGER DEFAULT 0")
+                    except Exception:
+                        pass
+
             finally:
                 conn.close()
     except Exception:
-        # Intentionally ignore and let the request handling surface errors if needed.
-        # Use proper migrations (Flask-Migrate/Alembic) for long-term safety.
+        # Best-effort only; migrations are recommended for production.
         pass
 
 
@@ -274,7 +403,7 @@ def profile_stats(profile_id):
 def new_game():
     payload = request.json or {}
     # Ensure schema is compatible before creating Player rows (helps with older SQLite DBs)
-    ensure_profile_columns()
+    ensure_schema_compatibility()
 
     # Diagnostic container to capture SQLite table_info (populated when possible)
     _schema_diag = {}
@@ -389,7 +518,7 @@ def add_player_to_game(game_id):
     Returns 201 with created player info, or 4xx on error.
     """
     # Ensure schema is compatible before touching player/throw rows (helps with older SQLite DBs)
-    ensure_profile_columns()
+    ensure_schema_compatibility()
     game = Game.query.get_or_404(game_id)
     data = request.json or {}
 
@@ -438,35 +567,174 @@ def add_player_to_game(game_id):
     return jsonify({"player": created}), 201
 
 
-# Game state (includes per-player last visit hits and stats)
+# -- additional endpoints for frontend flows (starter selection & manual next-leg) --
+@app.route("/api/games/<int:game_id>/set_starter", methods=["POST"])
+def set_starter(game_id):
+    """
+    Set which player (by player_id) or which player index (starter_index) should start the current leg.
+    Accepts JSON:
+      { "player_id": <int> }       # sets the game's current_start_index to the index of that player
+    or
+      { "starter_index": <int> }   # sets the game's current_start_index directly (0-based)
+    Returns 200 with updated start index on success.
+    """
+    game = Game.query.get_or_404(game_id)
+    data = request.json or {}
+    player_id = data.get("player_id")
+    starter_index = data.get("starter_index")
+
+    if player_id is not None:
+        try:
+            player_id = int(player_id)
+        except Exception:
+            return jsonify({"error": "Invalid player_id"}), 400
+        # find index of that player in the game's players list (preserve order)
+        index = None
+        for idx, p in enumerate(game.players):
+            if p.id == player_id:
+                index = idx
+                break
+        if index is None:
+            return jsonify({"error": "Player not part of this game"}), 404
+        game.current_start_index = index
+    elif starter_index is not None:
+        try:
+            si = int(starter_index)
+        except Exception:
+            return jsonify({"error": "Invalid starter_index"}), 400
+        if si < 0 or (len(game.players) and si >= len(game.players)):
+            return jsonify({"error": "starter_index out of range"}), 400
+        game.current_start_index = si
+    else:
+        return jsonify({"error": "player_id or starter_index required"}), 400
+
+    db.session.add(game)
+    db.session.commit()
+    return jsonify({"status": "ok", "current_start_index": game.current_start_index})
+
+
+@app.route("/api/games/<int:game_id>/next_leg", methods=["POST"])
+def next_leg(game_id):
+    """
+    Manually advance to the next leg. This will:
+      - reset all players' current_score to their starting_score
+      - increment game.current_leg
+      - rotate game.current_start_index by +1 modulo player count (to rotate starter)
+    Returns the updated leg and start index.
+    """
+    game = Game.query.get_or_404(game_id)
+
+    # If match already finished, disallow advancing
+    if getattr(game, "finished", False):
+        return jsonify({"error": "Game already finished"}), 400
+
+    # Reset all player's scores to their starting score
+    for pl in game.players:
+        pl.current_score = pl.starting_score
+        # leave per-player leg_wins/set_wins as-is; front-end will refresh these values
+
+    # Increment leg counter
+    game.current_leg = (game.current_leg or 1) + 1
+
+    # Rotate starting index
+    count = len(game.players) if game.players is not None else 0
+    if count:
+        game.current_start_index = ((game.current_start_index or 0) + 1) % count
+
+    db.session.add(game)
+    db.session.commit()
+    return jsonify({"status": "ok", "current_leg": game.current_leg, "current_start_index": game.current_start_index})
+
+
+# Endpoint: restart game (reset scores/leg/set counters and make game active)
+@app.route("/api/games/<int:game_id>/restart", methods=["POST"])
+def restart_game(game_id):
+    """
+    Restart the game: reset all players' current_score to their starting_score,
+    reset per-player leg_wins/set_wins counters to zero, reset current_set/current_leg
+    to the beginning and mark the game as active (finished=False).
+    """
+    game = Game.query.get_or_404(game_id)
+
+    # Reset per-player scores and counters
+    for pl in game.players:
+        pl.current_score = pl.starting_score
+        try:
+            pl.leg_wins = 0
+        except Exception:
+            # older DBs may not have these columns; ignore if absent
+            pass
+        try:
+            pl.set_wins = 0
+        except Exception:
+            pass
+        db.session.add(pl)
+
+    # Reset game-level counters and mark active
+    try:
+        game.current_set = 1
+    except Exception:
+        pass
+    try:
+        game.current_leg = 1
+    except Exception:
+        pass
+    try:
+        game.current_start_index = 0
+    except Exception:
+        pass
+    game.finished = False
+
+    db.session.add(game)
+    db.session.commit()
+    return jsonify({"status": "ok", "message": "Game restarted"})
+
+
+# Endpoint: end game (mark game finished/inactive)
+# Provide two routes for compatibility: /end and /end_game
+@app.route("/api/games/<int:game_id>/end", methods=["POST"])
+@app.route("/api/games/<int:game_id>/end_game", methods=["POST"])
+def end_game(game_id):
+    """
+    Mark the game as finished/inactive. When finished, throws are rejected by the server.
+    """
+    game = Game.query.get_or_404(game_id)
+    game.finished = True
+    db.session.add(game)
+    db.session.commit()
+    return jsonify({"status": "ok", "message": "Game ended"})
+
+
+# Game state (includes per-player last visit hits and stats, legs/sets state and match history)
 @app.route("/api/game_state/<int:game_id>", methods=["GET"])
 def game_state(game_id):
     game = Game.query.get_or_404(game_id)
     players_out = []
+    # produce per-player view
     for p in game.players:
+        # last visit (up to 3 throws)
         throws = Throw.query.filter_by(player_id=p.id).order_by(Throw.timestamp.desc()).limit(3).all()
         throws_chrono = list(reversed(throws))
         last_visit_score = sum(t.value * t.multiplier for t in throws_chrono) if throws_chrono else 0
         last_visit_hits = []
         for t in throws_chrono:
+            if t.value == 25 and t.multiplier == 2:
+                label = "BULL"
+            elif t.value == 25:
+                label = "SBULL"
+            else:
+                prefix = "T" if t.multiplier == 3 else ("D" if t.multiplier == 2 else "S")
+                label = f"{prefix}{t.value}"
             hit = {
                 "value": t.value,
                 "multiplier": t.multiplier,
-                "label": (
-                    "BULL"
-                    if (t.value == 25 and t.multiplier == 2)
-                    else (
-                        "SBULL"
-                        if t.value == 25
-                        else (("T" if t.multiplier == 3 else "D" if t.multiplier == 2 else "S") + str(t.value))
-                    )
-                ),
+                "label": label,
                 "x": t.x,
                 "y": t.y,
-                "timestamp": t.timestamp.isoformat(),
+                "timestamp": t.timestamp.isoformat() if t.timestamp else None,
             }
             last_visit_hits.append(hit)
-        # compute stats
+        # compute stats (profile-backed if present, otherwise per-player)
         total_scored = 0
         throw_count = 0
         avg_per_throw = 0
@@ -492,9 +760,7 @@ def game_state(game_id):
             sum_first9 = sum(t.value * t.multiplier for t in first9)
             n_first9 = len(first9)
             first9_avg_3dart = (sum_first9 / n_first9 * 3) if n_first9 else 0
-        suggestion = None
-        if p.current_score <= 170 and p.current_score > 0 and game.mode in ("501", "301"):
-            suggestion = find_checkout(p.current_score)
+
         players_out.append(
             {
                 "id": p.id,
@@ -509,61 +775,238 @@ def game_state(game_id):
                 "first9_avg_3dart": round(first9_avg_3dart, 1),
                 "last_visit_score": last_visit_score,
                 "last_visit_hits": last_visit_hits,
-                "suggestion": suggestion,
+                "suggestion": (
+                    find_checkout(p.current_score)
+                    if (p.current_score <= 170 and p.current_score > 0 and str(game.mode).lower().endswith("01"))
+                    else None
+                ),
+                "leg_wins": getattr(p, "leg_wins", 0),
+                "set_wins": getattr(p, "set_wins", 0),
             }
         )
-    return jsonify({"game": {"id": game.id, "mode": game.mode}, "players": players_out})
+
+    # Build match-level info and history
+    history = []
+    sets = MatchSet.query.filter_by(game_id=game.id).order_by(MatchSet.set_number).all()
+    for s in sets:
+        legs = []
+        for lg in sorted(s.legs, key=lambda L: L.leg_number):
+            legs.append({"leg_number": lg.leg_number, "winner_player_id": lg.winner_player_id})
+        history.append({"set_number": s.set_number, "winner_player_id": s.winner_player_id, "legs": legs})
+
+    game_info = {
+        "id": game.id,
+        "mode": game.mode,
+        "legs_to_win": game.legs_to_win,
+        "sets_to_win": game.sets_to_win,
+        "current_set": game.current_set,
+        "current_leg": game.current_leg,
+        "first_throw_method": game.first_throw_method,
+        "current_start_index": getattr(game, "current_start_index", 0),
+        "finished": bool(game.finished),
+    }
+
+    return jsonify({"game": game_info, "players": players_out, "history": history})
 
 
 # Throw API - accepts optional normalized x,y and records profile_id if player has one
 @app.route("/api/throw", methods=["POST"])
 def register_throw():
+    """
+    Register a single dart throw. This endpoint now handles:
+      - X01-style games (301/501/701/...) including leg/set management
+      - Cricket and other modes are left to existing logic (no change here yet)
+    Returns structured JSON statuses:
+      - ok: normal throw recorded
+      - bust: throw recorded but busted
+      - invalid_finish_needs_double: finish invalid (needs double)
+      - leg_won: a leg was won (includes updated leg/set counters)
+      - set_won: a set was won
+      - match_won: match finished (winner)
+    """
     data = request.json or {}
     player_id = data.get("player_id")
     if player_id is None:
         return jsonify({"error": "player_id required"}), 400
+
     value = int(data.get("value", 0))
     multiplier = int(data.get("multiplier", 0))
     x = data.get("x")
     y = data.get("y")
+
+    # Ensure DB schema compatibility (best-effort) before manipulating new columns
+    ensure_schema_compatibility()
+
     player = Player.query.get_or_404(player_id)
+    game = player.game
+
+    # If the game has been marked finished, do not accept throws.
+    # This prevents continuing to record throws after a match has been ended.
+    if getattr(game, "finished", False):
+        return jsonify({"error": "Game finished; no further throws accepted"}), 400
+
     scored = value * multiplier
     new_score = player.current_score - scored
+
+    # record throw
     t = Throw(player_id=player.id, value=value, multiplier=multiplier)
     if x is not None and y is not None:
         try:
             t.x = float(x)
             t.y = float(y)
-        except:
+        except Exception:
             t.x = None
             t.y = None
     if player.profile_id:
         t.profile_id = player.profile_id
-    if player.game.mode in ("501", "301"):
+
+    # Helper: reset scores for a new leg
+    def _reset_for_new_leg():
+        # reset all player's current scores to their starting_score
+        for pl in Game.query.get(game.id).players:
+            pl.current_score = pl.starting_score
+        # increment leg counter on game
+        game.current_leg = (game.current_leg or 1) + 1
+        # rotate start index (advance by 1 modulo player count)
+        try:
+            count = len(game.players)
+        except Exception:
+            count = len(Game.query.get(game.id).players)
+        if count:
+            game.current_start_index = ((game.current_start_index or 0) + 1) % count
+
+    # Helper: start a new set
+    def _start_new_set():
+        # reset per-player leg_wins to 0 and increment current_set
+        for pl in Game.query.get(game.id).players:
+            pl.leg_wins = 0
+        game.current_set = (game.current_set or 1) + 1
+        game.current_leg = 1
+        # reset start index back to 0 or leave rotation behavior as-is; keep rotation consistent
+        # (we do not override current_start_index here; it continues rotating)
+        # create a new MatchSet record (history)
+        ms = MatchSet(game_id=game.id, set_number=game.current_set)
+        db.session.add(ms)
+        db.session.flush()
+        return ms
+
+    # X01-style modes - check for busts/finishes
+    if str(game.mode).lower().endswith("01") or game.mode in ("501", "301", "701"):
+        # bust conditions
         if new_score < 0 or new_score == 1:
             db.session.add(t)
             db.session.commit()
             return jsonify({"status": "bust", "current_score": player.current_score})
+
         if new_score == 0:
+            # must finish on a double (or double bull 50)
             if multiplier != 2 and scored != 50:
                 db.session.add(t)
                 db.session.commit()
                 return jsonify({"status": "invalid_finish_needs_double", "current_score": player.current_score})
-            else:
-                player.current_score = 0
-                db.session.add(t)
+
+            # valid finish -> record throw and process leg/set/match transitions
+            player.current_score = 0
+            db.session.add(t)
+            # increment leg wins for this player
+            player.leg_wins = (player.leg_wins or 0) + 1
+
+            # persist changes and create leg record in history
+            # ensure we have a MatchSet for the current game.current_set
+            ms = MatchSet.query.filter_by(game_id=game.id, set_number=game.current_set).first()
+            if not ms:
+                ms = MatchSet(game_id=game.id, set_number=game.current_set)
+                db.session.add(ms)
+                db.session.flush()
+
+            # record the leg
+            leg_number = (len(ms.legs) + 1) if ms.legs is not None else 1
+            leg_record = Leg(match_set_id=ms.id, leg_number=leg_number, winner_player_id=player.id)
+            db.session.add(leg_record)
+
+            # Evaluate whether this leg win also wins the set
+            leg_threshold = game.legs_to_win or 0
+            set_threshold = game.sets_to_win or 0
+
+            resp = {
+                "status": "leg_won",
+                "player_id": player.id,
+                "player_name": player.name,
+                "leg_wins": player.leg_wins,
+                "set_wins": player.set_wins,
+                "current_set": game.current_set,
+                "current_leg": game.current_leg,
+            }
+
+            # If legs_to_win is configured and reached, award a set
+            if leg_threshold and player.leg_wins >= leg_threshold:
+                # award set
+                player.set_wins = (player.set_wins or 0) + 1
+                ms.winner_player_id = player.id
+                resp["status"] = "set_won"
+                resp["set_wins"] = player.set_wins
+
+                # reset leg counters for next set and persist set history
+                # start a new set (which also resets leg_wins)
+                _start_new_set()
+
+                # If sets_to_win configured and reached -> match won
+                if set_threshold and player.set_wins >= set_threshold:
+                    game.finished = True
+                    db.session.add(game)
+                    db.session.add(player)
+                    db.session.commit()
+                    return jsonify(
+                        {
+                            "status": "match_won",
+                            "player_id": player.id,
+                            "player_name": player.name,
+                            "set_wins": player.set_wins,
+                            "message": f"{player.name} has won the match!",
+                        }
+                    )
+
+                db.session.add(game)
                 db.session.add(player)
                 db.session.commit()
-                return jsonify({"status": "winner", "current_score": player.current_score})
+                return jsonify(
+                    {
+                        "status": "set_won",
+                        "player_id": player.id,
+                        "player_name": player.name,
+                        "set_wins": player.set_wins,
+                        "message": f"{player.name} has won set {game.current_set - 1}.",
+                    }
+                )
+
+            # Otherwise just finish the leg and start next leg
+            # Reset all players' current_score for the next leg
+            _reset_for_new_leg()
+            db.session.add(game)
+            db.session.add(player)
+            db.session.commit()
+
+            return jsonify(
+                {
+                    "status": "leg_won",
+                    "player_id": player.id,
+                    "player_name": player.name,
+                    "leg_wins": player.leg_wins,
+                    "message": f"{player.name} has won leg {game.current_leg - 1} of set {game.current_set}.",
+                }
+            )
+
+        # non-finishing valid throw: subtract score and persist
         player.current_score = new_score
         db.session.add(t)
         db.session.add(player)
         db.session.commit()
         return jsonify({"status": "ok", "current_score": player.current_score})
-    else:
-        db.session.add(t)
-        db.session.commit()
-        return jsonify({"status": "ok", "current_score": player.current_score})
+
+    # Fallback: non-X01 mode (Cricket, training, etc.) - just record the throw by default
+    db.session.add(t)
+    db.session.commit()
+    return jsonify({"status": "ok", "current_score": player.current_score})
 
 
 if __name__ == "__main__":
