@@ -95,6 +95,11 @@ class Player(db.Model):
     profile = db.relationship("Profile", backref="game_players")
     game_id = db.Column(db.Integer, db.ForeignKey("game.id"))
 
+    # Bot support: mark players that are automated bots and record a bot_type string.
+    # Bots participate in scoring/turn rotation but do NOT have per-throw stats persisted.
+    is_bot = db.Column(db.Boolean, default=False)
+    bot_type = db.Column(db.String(32), nullable=True)
+
     # Per-game counters for legs/sets (ephemeral to this Player instance which is tied to a Game)
     leg_wins = db.Column(db.Integer, default=0)
     set_wins = db.Column(db.Integer, default=0)
@@ -229,6 +234,30 @@ def ensure_schema_compatibility():
                 if _has_column("player", "set_wins") is False:
                     try:
                         conn.execute("ALTER TABLE player ADD COLUMN set_wins INTEGER DEFAULT 0")
+                    except Exception:
+                        pass
+                # Bot columns: mark player rows that represent automated bots and store a bot type
+                if _has_column("player", "is_bot") is False:
+                    try:
+                        # SQLite uses INTEGER for booleans
+                        conn.execute("ALTER TABLE player ADD COLUMN is_bot INTEGER DEFAULT 0")
+                    except Exception:
+                        pass
+                if _has_column("player", "set_wins") is False:
+                    try:
+                        conn.execute("ALTER TABLE player ADD COLUMN set_wins INTEGER DEFAULT 0")
+                    except Exception:
+                        pass
+                # Bot columns: mark player rows that represent automated bots and store a bot type
+                if _has_column("player", "is_bot") is False:
+                    try:
+                        # SQLite stores booleans as INTEGER (0/1)
+                        conn.execute("ALTER TABLE player ADD COLUMN is_bot INTEGER DEFAULT 0")
+                    except Exception:
+                        pass
+                if _has_column("player", "bot_type") is False:
+                    try:
+                        conn.execute("ALTER TABLE player ADD COLUMN bot_type VARCHAR(32)")
                     except Exception:
                         pass
 
@@ -698,6 +727,43 @@ def add_player_to_game(game_id):
     if game.mode == "301":
         starting = 301
 
+    # Support creating bots via payload: { "bot": true, "bot_type": "<type>", "name": "<optional name>" }.
+    # Bots are treated as players but marked as is_bot and will not have per-throw stats persisted.
+    if data.get("bot"):
+        bot_type = data.get("bot_type") or None
+        # If a specific name was not given, derive one from the bot_type
+        if not name or name == "Player":
+            if bot_type:
+                # nicer label e.g. "Skilled Bot" from 'skilled'
+                try:
+                    display_bot_name = f"{bot_type.capitalize()} Bot"
+                except Exception:
+                    display_bot_name = "Bot"
+            else:
+                display_bot_name = "Bot"
+        else:
+            display_bot_name = name
+
+        pl = Player(
+            name=display_bot_name,
+            starting_score=starting,
+            current_score=starting,
+            game_id=game.id,
+            is_bot=True,
+            bot_type=bot_type,
+        )
+        db.session.add(pl)
+        db.session.commit()
+
+        created = {
+            "id": pl.id,
+            "name": pl.name,
+            "is_bot": True,
+            "bot_type": pl.bot_type,
+            "current_score": pl.current_score,
+        }
+        return jsonify({"player": created}), 201
+
     pl = Player(name=name, starting_score=starting, current_score=starting, game_id=game.id)
     if profile:
         pl.profile_id = profile.id
@@ -1054,6 +1120,9 @@ def game_state(game_id):
                     if (p.current_score <= 170 and p.current_score > 0 and str(game.mode).lower().endswith("01"))
                     else None
                 ),
+                # Bot metadata so the client can detect bots and simulate them; defaults for legacy rows.
+                "is_bot": getattr(p, "is_bot", False),
+                "bot_type": getattr(p, "bot_type", None),
                 "leg_wins": getattr(p, "leg_wins", 0),
                 "set_wins": getattr(p, "set_wins", 0),
             }
@@ -1125,16 +1194,20 @@ def register_throw():
     new_score = player.current_score - scored
 
     # record throw
-    t = Throw(player_id=player.id, value=value, multiplier=multiplier)
-    if x is not None and y is not None:
-        try:
-            t.x = float(x)
-            t.y = float(y)
-        except Exception:
-            t.x = None
-            t.y = None
-    if player.profile_id:
-        t.profile_id = player.profile_id
+    # For bot players we do not persist per-throw stats. Still perform scoring and leg/set logic.
+    is_bot = getattr(player, "is_bot", False)
+    t = None
+    if not is_bot:
+        t = Throw(player_id=player.id, value=value, multiplier=multiplier)
+        if x is not None and y is not None:
+            try:
+                t.x = float(x)
+                t.y = float(y)
+            except Exception:
+                t.x = None
+                t.y = None
+        if player.profile_id:
+            t.profile_id = player.profile_id
 
     # Helper: reset scores for a new leg
     def _reset_for_new_leg():
@@ -1175,14 +1248,16 @@ def register_throw():
     if str(game.mode).lower().endswith("01") or game.mode in ("501", "301", "701"):
         # bust conditions
         if new_score < 0 or new_score == 1:
-            db.session.add(t)
+            if t is not None:
+                db.session.add(t)
             db.session.commit()
             return jsonify({"status": "bust", "current_score": player.current_score})
 
         if new_score == 0:
             # must finish on a double (or double bull 50)
             if multiplier != 2 and scored != 50:
-                db.session.add(t)
+                if t is not None:
+                    db.session.add(t)
                 db.session.commit()
                 return jsonify({"status": "invalid_finish_needs_double", "current_score": player.current_score})
 

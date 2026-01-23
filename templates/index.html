@@ -154,6 +154,17 @@
           <div style="display:flex; gap:8px; align-items:center;">
             <input id="newProfileName" placeholder="Add player name" style="padding:6px; border-radius:6px; background:var(--card); color:var(--muted); border:1px solid rgba(255,255,255,0.03)"/>
             <button id="addProfileBtn" class="btn">Add Player</button>
+
+            <!-- Bot controls: select bot skill and add bot -->
+            <select id="botTypeSelect" style="padding:6px; border-radius:6px; background:var(--card); color:var(--muted); border:1px solid rgba(255,255,255,0.03);">
+              <option value="beginner">Rookie (25)</option>
+              <option value="novice">Hobbyist (35)</option>
+              <option value="competent" selected>Competitor (55)</option>
+              <option value="skilled">Skilled (65)</option>
+              <option value="pro">Pro (85)</option>
+              <option value="champ">Champion (95)</option>
+            </select>
+            <button id="addBotBtn" class="btn">Add Bot</button>
           </div>
         </div>
 
@@ -297,6 +308,7 @@
     let players = []; // players in current game (cards left column)
     let profiles = []; // stored profiles from server
     let selectedProfileIds = new Set();
+    let selectedBots = []; // queued bots to include when starting a new game (each: {bot_type, name})
     let currentTurn = 0;
     let throwsInVisit = 0;
     let currentVisitHits = [];
@@ -386,6 +398,8 @@
     const endBtn = document.getElementById('endGameBtn');
     const addProfileBtn = document.getElementById('addProfileBtn');
     const newProfileNameEl = document.getElementById('newProfileName');
+    const addBotBtn = document.getElementById('addBotBtn');
+    const botTypeSelect = document.getElementById('botTypeSelect');
     const clearSelectionBtn = document.getElementById('clearSelectionBtn');
 
     // Centralized header button updater so enabling/disabling logic is consistent.
@@ -576,6 +590,41 @@
             addProfileBtn.disabled = false;
           }
         });
+    
+    // Add Bot button: either queue bot for next-start (when no active game) or add immediately to running game
+    addBotBtn.addEventListener('click', async () => {
+      const bt = (botTypeSelect && botTypeSelect.value) ? botTypeSelect.value : 'competent';
+      const displayName = `${bt.charAt(0).toUpperCase() + bt.slice(1)} Bot`;
+    
+      if (!currentGame) {
+        // queue bot to be included when starting a new game
+        if (!window.selectedBots) window.selectedBots = [];
+        if (window.selectedBots.length >= 6) { alert('Maximum 6 players allowed'); return; }
+        window.selectedBots.push({ bot_type: bt, name: displayName });
+        alert(`Queued bot for next game: ${displayName}`);
+        return;
+      }
+    
+      // Active game: POST to add a bot player immediately
+      try {
+        const res = await fetch(`/api/games/${currentGame}/add_player`, {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ bot: true, bot_type: bt, name: displayName })
+        });
+        if (res.ok) {
+          await loadState();
+          await fetchProfiles();
+        } else {
+          let j = null;
+          try { j = await res.json(); } catch(e) {}
+          alert((j && j.error) || 'Failed to add bot to game');
+        }
+      } catch (e) {
+        console.error('Error adding bot to game:', e);
+        alert('Network error while adding bot to game');
+      }
+    });
 
     clearSelectionBtn.addEventListener('click', () => {
       if (currentGame) return;
@@ -884,6 +933,8 @@
       }
 
       renderPlayers(players);
+      // If the now-active player is a bot, kick off simulation
+      try { maybeStartBotIfActive(); } catch(e){ console.warn('maybeStartBotIfActive failed', e); }
     }
 
     function renderPlayers(pls) {
@@ -975,6 +1026,121 @@
               s.title = `${label}`;
             }
           }
+        }
+      }
+
+      // --- Bot simulation support (client-side) ---
+      // Basic bot type mapping and simple segment selection logic.
+      const BOT_TYPES = {
+        beginner:  { label: 'Rookie (25)', accuracy: 0.25 },
+        novice:    { label: 'Hobbyist (35)', accuracy: 0.35 },
+        competent: { label: 'Competitor (55)', accuracy: 0.55 },
+        skilled:   { label: 'Skilled (65)', accuracy: 0.65 },
+        pro:       { label: 'Pro (85)', accuracy: 0.85 },
+        champ:     { label: 'Champion (95)', accuracy: 0.95 }
+      };
+
+      // Choose a plausible segment for a bot throw. This is intentionally simple:
+      // - Bots generally aim for T20, sometimes bull; multiplier chosen probabilistically from accuracy.
+      function botChooseSegment(playerScore, botType) {
+        const bt = BOT_TYPES[botType] || BOT_TYPES['competent'];
+        const acc = bt.accuracy;
+        // If close to finish (<170), occasionally attempt a basic finishing double (very simple heuristic)
+        if (playerScore <= 170 && Math.random() < Math.min(0.8, acc + 0.1)) {
+          // Try to select a double that doesn't overshoot; naive approach: aim for double of value=playerScore/2 if even
+          if (playerScore % 2 === 0 && playerScore <= 40) {
+            const dbl = playerScore / 2;
+            const label = dbl === 25 ? 'BULL' : `D${dbl}`;
+            return { value: dbl === 25 ? 25 : dbl, multiplier: dbl === 25 ? 2 : 2, label: label, x: 0.5 + (Math.random()-0.5)*0.02, y: 0.5 + (Math.random()-0.5)*0.02 };
+          }
+          // otherwise fall through to normal aiming
+        }
+
+        // Default target: 20
+        let target = 20;
+        // small chance to aim bull if skilled
+        if (Math.random() < 0.04 && acc > 0.6) {
+          target = 25;
+        }
+
+        // Determine multiplier biased by accuracy
+        let multiplier = 1;
+        const r = Math.random();
+        if (r < acc * 0.6) multiplier = 3;
+        else if (r < acc * 0.95) multiplier = 2;
+        else multiplier = 1;
+
+        let label;
+        if (target === 25) {
+          label = multiplier === 2 ? 'BULL' : 'SBULL';
+        } else {
+          label = multiplier === 3 ? `T${target}` : (multiplier === 2 ? `D${target}` : `S${target}`);
+        }
+
+        const x = 0.5 + (Math.random() - 0.5) * 0.28;
+        const y = 0.5 + (Math.random() - 0.5) * 0.28;
+        return { value: target, multiplier: multiplier, label: label, x: Math.max(0, Math.min(1, x)), y: Math.max(0, Math.min(1, y)) };
+      }
+
+      // In-progress flag to avoid double-simulating
+      window._botSimRunningForPlayerId = null;
+
+      // Simulate up to 3 darts for the bot with small delays between throws.
+      async function simulateBotVisit(player) {
+        if (!player || !player.id) return;
+        if (window._botSimRunningForPlayerId === player.id) return;
+        window._botSimRunningForPlayerId = player.id;
+        try {
+          for (let i = 0; i < 3; i++) {
+            // If game finished or active player changed, stop
+            if (gameFinished) break;
+            if (!players || !players[currentTurn] || players[currentTurn].id !== player.id) break;
+
+            const seg = botChooseSegment(player.current_score, player.bot_type || 'competent');
+
+            // random delay to mimic human timing
+            const delay = 300 + Math.floor(Math.random() * 700);
+            await new Promise(r => setTimeout(r, delay));
+
+            try {
+              // Re-use existing onDartHit flow so server-side logic is identical
+              if (typeof window.onDartHit === 'function') {
+                window.onDartHit(seg);
+              } else {
+                // As a fallback, POST directly to /api/throw (server will update scores)
+                fetch('/api/throw', {
+                  method: 'POST',
+                  headers: {'Content-Type':'application/json'},
+                  body: JSON.stringify({ player_id: player.id, value: seg.value, multiplier: seg.multiplier, x: seg.x, y: seg.y })
+                }).catch(()=>{});
+              }
+            } catch (e) {
+              console.warn('Bot throw failed', e);
+            }
+
+            // small pause between darts
+            await new Promise(r => setTimeout(r, 120 + Math.floor(Math.random()*200)));
+
+            // if the bot's turn ended (due to finish/bust/advance), break
+            if (!players || !players[currentTurn] || players[currentTurn].id !== player.id) break;
+          }
+        } finally {
+          window._botSimRunningForPlayerId = null;
+        }
+      }
+
+      // Kick off bot simulation if the current active player is a bot
+      function maybeStartBotIfActive() {
+        try {
+          if (!players || !players.length) return;
+          const cur = players[currentTurn];
+          if (!cur) return;
+          if (cur.is_bot) {
+            // Start simulating if not already running
+            simulateBotVisit(cur).catch(e=>console.warn('simulateBotVisit error',e));
+          }
+        } catch (e) {
+          console.warn('maybeStartBotIfActive failed', e);
         }
       }
 
@@ -1083,6 +1249,8 @@
               currentTurn = intendedActiveIndex;
             }
             highlightActivePlayer();
+            // If the newly highlighted player is a bot, start their simulated visit.
+            try { maybeStartBotIfActive(); } catch(e) { /* best-effort */ }
           } catch (e) {
             // ignore
           }
@@ -1163,6 +1331,12 @@
         let playersPayload = [];
         if (willStartWithSelection) {
           playersPayload = Array.from(selectedProfileIds);
+          // Include any queued bots (added via Add Bot) as descriptors so server can create bot players.
+          if (window.selectedBots && window.selectedBots.length) {
+            window.selectedBots.forEach(b => {
+              playersPayload.push({ bot: true, bot_type: b.bot_type, name: b.name });
+            });
+          }
         } else {
           playersPayload = [pendingProfileToAutoAdd];
         }
