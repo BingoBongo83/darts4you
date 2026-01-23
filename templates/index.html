@@ -388,6 +388,23 @@
     const newProfileNameEl = document.getElementById('newProfileName');
     const clearSelectionBtn = document.getElementById('clearSelectionBtn');
 
+    // Centralized header button updater so enabling/disabling logic is consistent.
+    function updateHeaderButtons() {
+      try {
+        if (!startBtn || !restartGameBtn || !endBtn) return;
+        // Start disabled when a game is active; enabled otherwise
+        startBtn.disabled = !!currentGame;
+        // Restart and End are enabled only when there is an active non-finished game.
+        // If the game is finished we do not allow restart/end from header (server semantics apply).
+        const activeAvailable = !!currentGame && !gameFinished;
+        restartGameBtn.disabled = !activeAvailable;
+        endBtn.disabled = !activeAvailable;
+      } catch (e) {
+        // best-effort: do not throw UI errors
+        console.warn('updateHeaderButtons failed', e);
+      }
+    }
+
     // Fetch and render profiles (stored players)
     async function fetchProfiles() {
       const r = await fetch('/api/profiles');
@@ -649,11 +666,10 @@
       players = [];
       document.getElementById('playersList').innerHTML = '';
       lockProfileInteractions(false);
-      startBtn.disabled = false;
-      restartGameBtn.disabled = true;
-      endBtn.disabled = true;
       selectedProfileIds.clear();
       updateSelectedUI();
+      // Ensure header buttons reflect current state (no active game)
+      updateHeaderButtons();
       window.clearMarkers();
     });
 
@@ -778,10 +794,9 @@
           }
 
           // Ensure UI reflects an active game after restart
-          startBtn.disabled = true;
-          restartGameBtn.disabled = false;
-          endBtn.disabled = false;
           lockProfileInteractions(true);
+          // Use centralized updater so the header buttons' logic is uniform
+          updateHeaderButtons();
 
           // If server restarted the game, reload authoritative state from server (preserve our locally-decided currentTurn)
           if (serverRestarted) {
@@ -1193,9 +1208,8 @@
         })();
 
         // mark UI state
-        startBtn.disabled = true;
-        restartGameBtn.disabled = false;
-        endBtn.disabled = false;
+        // Use centralized updater so enabling/disabling is consistent across flows
+        updateHeaderButtons();
 
         // If the chosen starter method is 'bulls', kick off the bulls-decider UI flow
         if (firstMethod === 'bulls') {
@@ -1339,8 +1353,8 @@
               // restore handler and hide modal
               window.onDartHit = prevHandler;
               backdrop.style.display = 'none';
-              startBtn.disabled = true;
-              endBtn.disabled = false;
+              // Ensure header buttons reflect the new game state after bulls decider
+              updateHeaderButtons();
               fetchProfiles().catch(()=>{});
               loadState().catch(()=>{});
             }
